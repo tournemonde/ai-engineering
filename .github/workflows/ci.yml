@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main, "session2/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint-test-smoke:
+    runs-on: ubuntu-latest
+    env:
+      # Dummy keys so Settings can load if any code path touches them.
+      OPENAI_API_KEY: test-openai-key
+      ANTHROPIC_API_KEY: test-anthropic-key
+      LLM_PROVIDER: openai
+      LLM_MODEL: gpt-4o-mini
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Ruff check
+        run: uv run ruff check app tests
+
+      - name: Ruff format
+        run: uv run ruff format --check app tests
+
+      - name: Pytest
+        run: uv run pytest -v
+
+      - name: Smoke health endpoint
+        run: |
+          uv run uvicorn app.main:app --host 127.0.0.1 --port 8000 &
+          SERVER_PID=$!
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8000/health; then
+              kill "$SERVER_PID"
+              exit 0
+            fi
+            sleep 1
+          done
+          kill "$SERVER_PID" || true
+          echo "Health smoke failed"
+          exit 1
