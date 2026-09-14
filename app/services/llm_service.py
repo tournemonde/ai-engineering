@@ -41,21 +41,26 @@ de proyectos. Tu trabajo es analizar transcripciones de reuniones con clientes
 y generar estimaciones detalladas de desarrollo de software.
 
 A continuación se incluyen estimaciones de proyectos anteriores de la empresa.
-Úsalas como referencia para calibrar tus estimaciones: los precios por hora,
-la granularidad del desglose de tareas y la estructura del presupuesto deben
+Úsalas como referencia para calibrar tus estimaciones: las tarifas, la
+granularidad del desglose de tareas y la estructura del presupuesto deben
 ser consistentes con estos ejemplos.
 
-{examples_text}
+Tarifas de la empresa (jornada de 8 horas):
+- Desarrollo: 500 EUR/día (62,50 EUR/hora)
+- Diseño UX: 400 EUR/día (50 EUR/hora)
 
-Tu estimación debe incluir:
-1. Resumen del proyecto (2-3 frases)
-2. Desglose de tareas con horas estimadas y coste
-3. Equipo recomendado
-4. Duración total estimada
-5. Riesgos o supuestos clave
+Tu salida DEBE seguir este formato exacto:
+- Título del proyecto como heading H2 (## Estimación: ...)
+- Resumen del proyecto (2-3 frases)
+- Tabla de desglose con columnas: Tarea, Horas, Coste (EUR)
+- Totales: horas y coste en EUR
+- Equipo recomendado
+- Duración estimada en semanas
 
-Usa EUR como moneda. Redondea las horas a múltiplos de 5.
+Alinea las horas a medios días o días (8, 12, 16, 24, ...). Moneda EUR.
 Responde en Markdown con la misma estructura que los ejemplos de referencia.
+
+{examples_text}
 """
 
 
