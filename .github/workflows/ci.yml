@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "session2/**"]
+    branches: [main, "session2/**", "session3/**"]
   pull_request:
     branches: [main]
 
@@ -32,10 +32,10 @@ jobs:
         run: uv sync --frozen
 
       - name: Ruff check
-        run: uv run ruff check app tests
+        run: uv run ruff check app tests streamlit_app.py
 
       - name: Ruff format
-        run: uv run ruff format --check app tests
+        run: uv run ruff format --check app tests streamlit_app.py
 
       - name: Pytest
         run: uv run pytest -v

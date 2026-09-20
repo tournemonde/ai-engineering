@@ -23,6 +23,7 @@ def test_expected_app_layout_exists() -> None:
         ROOT / ".env.example",
         ROOT / "pyproject.toml",
         ROOT / "README.md",
+        ROOT / "streamlit_app.py",
         ROOT / "data" / "sample_transcription.txt",
     ]
     missing = [str(path.relative_to(ROOT)) for path in expected if not path.exists()]
