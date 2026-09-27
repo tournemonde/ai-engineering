@@ -1,18 +1,35 @@
-# Python-generated files
+# Environment variables
+.env
+
+# Python
 __pycache__/
-*.py[oc]
-build/
+*.pyc
+*.pyo
+*.egg-info/
 dist/
-wheels/
-*.egg-info
+build/
 
 # Virtual environments
-.venv
-.venv-cag
+.venv/
+venv/
+
+# Testing / linting caches
+.pytest_cache/
+.ruff_cache/
+
+# OS files
 .DS_Store
-.env
-reference/
+
+# IDEs
+.idea/
+.vscode/
+
+# Session guides / docs
+docs/
 
 # Cursor / RuleForge OS (local governance)
 .cursor/
 
+# Course notes (local)
+reference/
+.venv-cag

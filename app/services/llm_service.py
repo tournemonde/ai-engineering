@@ -1,237 +1,253 @@
-"""LLM service for CAG software estimations (async + sync streaming)."""
+"""Estimation orchestration: prompt building, optional preprocessing, and dispatch
+to the LLM. The actual provider calls now live in :mod:`app.services.llm_wrapper`,
+so this module focuses on Session 2 concerns (knobs, prompt assembly) while the
+wrapper handles cache, fallback, and cost tracking transparently.
+"""
 
 from __future__ import annotations
 
 import time
-from collections.abc import Iterator
-from typing import Any, TypedDict
+from dataclasses import dataclass
+from typing import Any
 
-from anthropic import Anthropic, AsyncAnthropic
-from openai import AsyncOpenAI, OpenAI
+import structlog
 
-from app.config import Settings, get_settings
-from app.context.examples import ESTIMATION_EXAMPLES, EstimationExample
+from app.context.examples import format_examples_for_prompt, select_examples
+from app.dependencies import get_llm_wrapper
+from app.schemas.estimation import ExampleFormat, PreprocessingMode
 
+log = structlog.get_logger()
 
-class StreamMetrics(TypedDict, total=False):
-    """Side-channel metrics filled while streaming tokens."""
-
-    model: str
-    provider: str
-    input_tokens: int | None
-    output_tokens: int | None
-    latency_ms: float
+DEFAULT_MAX_TOKENS = 4000
+EXTRACTION_MAX_TOKENS = 1500
 
 
-def format_examples(examples: list[EstimationExample]) -> str:
-    """Format static examples as delimited Markdown for the system prompt."""
-    blocks: list[str] = []
-    for index, example in enumerate(examples, start=1):
-        blocks.append(
-            "\n".join(
-                [
-                    f"===== ESTIMACIÓN DE REFERENCIA {index} =====",
-                    "### Resumen de la reunión original",
-                    example["meeting_summary"].strip(),
-                    "",
-                    "### Estimación generada",
-                    example["estimation"].strip(),
-                    "",
-                ]
-            )
-        )
-    blocks.append("===== FIN DE ESTIMACIONES DE REFERENCIA =====")
-    return "\n".join(blocks)
+class LLMServiceError(Exception):
+    """Raised when the LLM provider call fails."""
 
 
-def build_system_prompt(examples: list[EstimationExample] | None = None) -> str:
-    """Build the CAG system prompt with role, rules, and reference examples."""
-    selected = examples if examples is not None else ESTIMATION_EXAMPLES
-    examples_text = format_examples(selected)
-    return f"""Eres un consultor senior de software con 15 años de experiencia en estimación
-de proyectos. Tu trabajo es analizar transcripciones de reuniones con clientes
-y generar estimaciones detalladas de desarrollo de software.
+# ---------------------------------------------------------------------------
+# Prompt building blocks
+#
+# The two ACTIVE_OUTPUT_PROMPT variants live side by side so the instructor
+# can switch between them in the live session (Block 3.4) by editing the
+# ACTIVE_OUTPUT_PROMPT assignment below. Uvicorn `--reload` picks up the
+# change automatically.
+# ---------------------------------------------------------------------------
 
-A continuación se incluyen estimaciones de proyectos anteriores de la empresa.
-Úsalas como referencia para calibrar tus estimaciones: las tarifas, la
-granularidad del desglose de tareas y la estructura del presupuesto deben
-ser consistentes con estos ejemplos.
+PROMPT_OUTPUT_BASIC = "Generate an estimation for the project described above."
 
-Tarifas de la empresa (jornada de 8 horas):
-- Desarrollo: 500 EUR/día (62,50 EUR/hora)
-- Diseño UX: 400 EUR/día (50 EUR/hora)
+PROMPT_OUTPUT_STRUCTURED = """\
+Generate the estimation with this exact structure:
 
-Tu salida DEBE seguir este formato exacto:
-- Título del proyecto como heading H2 (## Estimación: ...)
-- Resumen del proyecto (2-3 frases)
-- Tabla de desglose con columnas: Tarea, Horas, Coste (EUR)
-- Totales: horas y coste en EUR
-- Equipo recomendado
-- Duración estimada en semanas
+## Project summary
+[2-3 sentences describing the project scope and goals]
 
-Alinea las horas a medios días o días (8, 12, 16, 24, ...). Moneda EUR.
-Responde en Markdown con la misma estructura que los ejemplos de referencia.
+## Task breakdown
+| Task | Hours | Cost (EUR) |
+[one row per task; cost = hours * 62.50 EUR for developer tasks]
 
-{examples_text}
+## Totals
+- Total hours: [number]
+- Total cost: [number] EUR
+- Recommended team: [composition]
+- Estimated duration: [weeks]
+
+## Risks and assumptions
+- [3-5 bullet points covering technical risks, scope assumptions, and external dependencies]
 """
 
+# >>> Block 3.4 live switch: change the right-hand side to PROMPT_OUTPUT_STRUCTURED
+ACTIVE_OUTPUT_PROMPT = PROMPT_OUTPUT_BASIC
 
-async def _call_openai(
-    *,
-    settings: Settings,
-    system_prompt: str,
-    transcription: str,
-) -> dict[str, Any]:
-    client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
-    response = await client.chat.completions.create(
-        model=settings.LLM_MODEL,
-        max_tokens=settings.MAX_OUTPUT_TOKENS,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcription},
-        ],
+
+INLINE_CLEANING_BLOCK = """\
+The transcription you receive is from a real meeting and may contain:
+- Informal small talk you must ignore
+- Implicit requirements you must surface explicitly
+- Contradictions where you must trust the most recent statement
+- Non-technical jargon you must interpret
+
+Extract ONLY the functional and technical requirements relevant to the estimation."""
+
+
+EXTRACTION_SYSTEM_PROMPT = (
+    "You are an analyst. Read the meeting transcription and produce a clean, "
+    "deduplicated bullet list of functional requirements, non-functional "
+    "requirements, integrations, constraints and explicit deadlines. Ignore "
+    "fillers, divagations and off-topic remarks. Output Markdown only."
+)
+
+
+@dataclass
+class GenerationOptions:
+    """Per-request knobs that drive prompt construction and the LLM call."""
+
+    preprocessing: PreprocessingMode = "none"
+    example_format: ExampleFormat = "markdown"
+    num_examples: int = 3
+    use_examples: bool = True
+    model: str | None = None
+    max_tokens: int = DEFAULT_MAX_TOKENS
+    thinking_budget: int | None = None
+
+
+# ---------------------------------------------------------------------------
+# System prompt construction
+# ---------------------------------------------------------------------------
+
+
+def build_system_prompt(
+    example_format: ExampleFormat = "markdown",
+    num_examples: int = 3,
+    use_examples: bool = True,
+    inline_cleaning: bool = False,
+) -> str:
+    """Assemble the system prompt with role, rates, output spec and (optionally) examples."""
+    role = (
+        "You are a senior software consultant with 15+ years of experience in project "
+        "estimation. Your task is to produce a detailed software project estimation based "
+        "on a meeting transcription provided by the user."
     )
-    content = response.choices[0].message.content or ""
-    usage = response.usage
-    return {
-        "estimation": content,
-        "model": settings.LLM_MODEL,
-        "provider": "openai",
-        "input_tokens": usage.prompt_tokens if usage else None,
-        "output_tokens": usage.completion_tokens if usage else None,
-    }
-
-
-async def _call_anthropic(
-    *,
-    settings: Settings,
-    system_prompt: str,
-    transcription: str,
-) -> dict[str, Any]:
-    client = AsyncAnthropic(api_key=settings.ANTHROPIC_API_KEY)
-    response = await client.messages.create(
-        model=settings.LLM_MODEL,
-        max_tokens=settings.MAX_OUTPUT_TOKENS,
-        system=system_prompt,
-        messages=[{"role": "user", "content": transcription}],
+    rates = (
+        "Use a developer rate of approximately 62.50 EUR/hour (500 EUR/day) and a designer "
+        "rate of approximately 50 EUR/hour (400 EUR/day). Provide realistic, well-justified "
+        "numbers."
     )
-    text_parts = [
-        block.text for block in response.content if getattr(block, "type", None) == "text"
-    ]
-    usage = response.usage
-    return {
-        "estimation": "\n".join(text_parts),
-        "model": settings.LLM_MODEL,
-        "provider": "anthropic",
-        "input_tokens": usage.input_tokens if usage else None,
-        "output_tokens": usage.output_tokens if usage else None,
-    }
+
+    examples_block = ""
+    if use_examples and num_examples > 0:
+        rendered = format_examples_for_prompt(select_examples(num_examples), example_format)
+        if rendered:
+            examples_block = (
+                "Below are reference estimations from previous projects. Use them as a guide "
+                "for structure, level of detail, and realistic pricing. Adapt the content to "
+                "match the specific project described in the transcription.\n\n" + rendered
+            )
+
+    cleaning_block = INLINE_CLEANING_BLOCK if inline_cleaning else ""
+
+    sections = [role, cleaning_block, rates, ACTIVE_OUTPUT_PROMPT, examples_block]
+    return "\n\n".join(s for s in sections if s)
 
 
-async def generate_estimation(
-    transcription: str,
-    settings: Settings | None = None,
+# ---------------------------------------------------------------------------
+# LLM dispatch (single seam — tests monkeypatch this)
+# ---------------------------------------------------------------------------
+
+
+def _invoke_llm(
+    *,
+    system_prompt: str,
+    user_message: str,
+    model_override: str | None,
+    max_tokens: int,
+    thinking_budget: int | None,
 ) -> dict[str, Any]:
-    """Generate a software estimation from a meeting transcription (single-turn CAG)."""
-    resolved = settings or get_settings()
-    system_prompt = build_system_prompt()
-
-    if resolved.LLM_PROVIDER == "openai":
-        return await _call_openai(
-            settings=resolved,
-            system_prompt=system_prompt,
-            transcription=transcription,
-        )
-    return await _call_anthropic(
-        settings=resolved,
+    """Single seam through which every LLM call passes. Tests monkeypatch this."""
+    wrapper = get_llm_wrapper()
+    return wrapper.complete(
         system_prompt=system_prompt,
-        transcription=transcription,
+        user_message=user_message,
+        model_override=model_override,
+        max_tokens=max_tokens,
+        thinking_budget=thinking_budget,
     )
 
 
-# snippet: sync OpenAI token stream
-def _stream_openai(
-    *,
-    settings: Settings,
-    system_prompt: str,
+# ---------------------------------------------------------------------------
+# Two-phase preprocessing (phase 1: requirement extraction)
+# ---------------------------------------------------------------------------
+
+
+def extract_requirements(
     transcription: str,
-    metrics: StreamMetrics,
-) -> Iterator[str]:
-    client = OpenAI(api_key=settings.OPENAI_API_KEY)
-    start = time.perf_counter()
-    stream = client.chat.completions.create(
-        model=settings.LLM_MODEL,
-        max_tokens=settings.MAX_OUTPUT_TOKENS,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": transcription},
-        ],
-        stream=True,
-        stream_options={"include_usage": True},
+    opts: GenerationOptions,
+) -> tuple[str, dict, float]:
+    """Run the cheap phase-1 LLM call that turns a raw transcription into clean requirements.
+
+    Returns ``(requirements_text, usage_dict, cost_usd)``.
+    """
+    log.info("extracting_requirements", model_override=opts.model)
+
+    result = _invoke_llm(
+        system_prompt=EXTRACTION_SYSTEM_PROMPT,
+        user_message=transcription,
+        model_override=opts.model,
+        max_tokens=EXTRACTION_MAX_TOKENS,
+        thinking_budget=None,
     )
-    for chunk in stream:
-        if chunk.choices:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                yield delta
-        usage = getattr(chunk, "usage", None)
-        if usage is not None:
-            metrics["input_tokens"] = usage.prompt_tokens
-            metrics["output_tokens"] = usage.completion_tokens
-    metrics["model"] = settings.LLM_MODEL
-    metrics["provider"] = "openai"
-    metrics["latency_ms"] = round((time.perf_counter() - start) * 1000, 1)
+
+    return (
+        result["estimation"],
+        {
+            "input": result["usage"]["input_tokens"],
+            "output": result["usage"]["output_tokens"],
+        },
+        float(result.get("cost_usd", 0.0)),
+    )
 
 
-# snippet: sync Anthropic token stream
-def _stream_anthropic(
-    *,
-    settings: Settings,
-    system_prompt: str,
+# ---------------------------------------------------------------------------
+# Main entrypoint
+# ---------------------------------------------------------------------------
+
+
+def generate_estimation(
     transcription: str,
-    metrics: StreamMetrics,
-) -> Iterator[str]:
-    client = Anthropic(api_key=settings.ANTHROPIC_API_KEY)
-    start = time.perf_counter()
-    with client.messages.stream(
-        model=settings.LLM_MODEL,
-        max_tokens=settings.MAX_OUTPUT_TOKENS,
-        system=system_prompt,
-        messages=[{"role": "user", "content": transcription}],
-    ) as stream:
-        for text in stream.text_stream:
-            if text:
-                yield text
-        final = stream.get_final_message()
-        usage = final.usage
-        metrics["input_tokens"] = usage.input_tokens if usage else None
-        metrics["output_tokens"] = usage.output_tokens if usage else None
-    metrics["model"] = settings.LLM_MODEL
-    metrics["provider"] = "anthropic"
-    metrics["latency_ms"] = round((time.perf_counter() - start) * 1000, 1)
+    opts: GenerationOptions | None = None,
+) -> dict[str, Any]:
+    """Generate a software estimation from a meeting transcription using the configured LLM."""
+    opts = opts or GenerationOptions()
 
+    t0 = time.perf_counter()
 
-def stream_estimation(
-    transcription: str,
-    settings: Settings | None = None,
-    metrics: StreamMetrics | None = None,
-) -> Iterator[str]:
-    """Yield estimation tokens for Streamlit (single-turn CAG, sync SDKs)."""
-    resolved = settings or get_settings()
-    system_prompt = build_system_prompt()
-    side_channel: StreamMetrics = metrics if metrics is not None else {}
+    prep_usage = {"input": 0, "output": 0}
+    prep_cost = 0.0
+    extracted_requirements: str | None = None
+    user_input = transcription
 
-    if resolved.LLM_PROVIDER == "openai":
-        yield from _stream_openai(
-            settings=resolved,
+    if opts.preprocessing == "two_phase":
+        extracted_requirements, prep_usage, prep_cost = extract_requirements(transcription, opts)
+        user_input = extracted_requirements
+
+    system_prompt = build_system_prompt(
+        example_format=opts.example_format,
+        num_examples=opts.num_examples,
+        use_examples=opts.use_examples,
+        inline_cleaning=(opts.preprocessing == "inline_cleaning"),
+    )
+
+    log.info(
+        "generating_estimation",
+        model_override=opts.model,
+        preprocessing=opts.preprocessing,
+        example_format=opts.example_format,
+        num_examples=opts.num_examples,
+        use_examples=opts.use_examples,
+        max_tokens=opts.max_tokens,
+        thinking_budget=opts.thinking_budget,
+    )
+
+    try:
+        result = _invoke_llm(
             system_prompt=system_prompt,
-            transcription=transcription,
-            metrics=side_channel,
+            user_message=user_input,
+            model_override=opts.model,
+            max_tokens=opts.max_tokens,
+            thinking_budget=opts.thinking_budget,
         )
-        return
-    yield from _stream_anthropic(
-        settings=resolved,
-        system_prompt=system_prompt,
-        transcription=transcription,
-        metrics=side_channel,
-    )
+    except Exception as exc:
+        log.error("llm_call_failed", error=str(exc), error_type=type(exc).__name__)
+        raise LLMServiceError(f"LLM call failed: {exc}") from exc
+
+    result["usage"]["preprocessing_input_tokens"] = prep_usage["input"]
+    result["usage"]["preprocessing_output_tokens"] = prep_usage["output"]
+    result["preprocessing"] = opts.preprocessing
+    result["extracted_requirements"] = extracted_requirements
+    result["latency_ms"] = int((time.perf_counter() - t0) * 1000)
+    result["cost_usd"] = round(float(result.get("cost_usd", 0.0)) + prep_cost, 6)
+    # ``cache_hit`` is whatever the wrapper returned for the main estimation call.
+    result.setdefault("cache_hit", False)
+
+    return result

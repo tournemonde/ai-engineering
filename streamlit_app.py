@@ -1,111 +1,109 @@
-"""Streamlit conversational UI for the CAG software estimator."""
+"""Streamlit chat UI for the estimator.
+
+Streamlit acts as an HTTP client of the FastAPI service: it POSTs to
+``/api/v1/estimate/stream`` and renders the SSE chunks live with
+``st.write_stream``. The endpoint URL is read from ``ESTIMATOR_API_BASE_URL``
+(loaded from the same ``.env`` as the API), so the same UI works against a
+local uvicorn or against docker-compose.
+"""
 
 from __future__ import annotations
 
-from typing import Any
+import os
+from collections.abc import Iterator
 
+import httpx
 import streamlit as st
+from dotenv import load_dotenv
 
-from app.config import Settings, get_settings
-from app.context.examples import ESTIMATION_EXAMPLES
-from app.services.llm_service import StreamMetrics, build_system_prompt, stream_estimation
+load_dotenv()
 
+API_BASE_URL = os.getenv("ESTIMATOR_API_BASE_URL", "http://localhost:8000")
+STREAM_ENDPOINT = f"{API_BASE_URL.rstrip('/')}/api/v1/estimate/stream"
 
-def _load_settings() -> Settings | None:
-    """Load settings from .env; show an error if credentials are missing."""
-    try:
-        return get_settings()
-    except Exception as exc:  # noqa: BLE001 — surface config errors in the UI
-        st.error(f"No se pudo cargar la configuración: {exc}")
-        st.info(
-            "Copia `.env.example` a `.env` y define `OPENAI_API_KEY` o "
-            "`ANTHROPIC_API_KEY` según `LLM_PROVIDER`."
-        )
-        return None
+st.set_page_config(page_title="Software Estimator", page_icon="📊")
+st.title("Software Estimator")
+st.caption(
+    "Paste a meeting transcription. The answer streams token by token from the "
+    "FastAPI service over Server-Sent Events."
+)
 
 
-def _init_session_state() -> None:
-    """Ensure chat history and last-call metrics exist in session_state."""
-    if "messages" not in st.session_state:
+def stream_estimation(transcription: str) -> Iterator[str]:
+    """POST to the SSE endpoint and yield text chunks as they arrive.
+
+    Per the SSE spec, a single message with internal newlines is serialised as
+    multiple ``data:`` lines, and the client must join them with ``\\n`` to
+    reconstruct the original payload. A blank line terminates the message.
+    """
+    payload = {"transcription": transcription}
+    with httpx.stream(
+        "POST",
+        STREAM_ENDPOINT,
+        json=payload,
+        timeout=httpx.Timeout(120.0, connect=10.0),
+        headers={"Accept": "text/event-stream"},
+    ) as response:
+        response.raise_for_status()
+        current_event = "token"
+        data_lines: list[str] = []
+        for raw_line in response.iter_lines():
+            if raw_line == "":
+                if data_lines:
+                    payload_text = "\n".join(data_lines)
+                    data_lines = []
+                    if current_event == "token":
+                        yield payload_text
+                    elif current_event == "error":
+                        yield f"\n\n[error] {payload_text}"
+                    elif current_event == "done":
+                        return
+                current_event = "token"
+                continue
+            if raw_line.startswith("event:"):
+                current_event = raw_line[6:].strip()
+            elif raw_line.startswith("data:"):
+                # The SSE spec defines exactly one space after `data:` as
+                # framing, not payload — preserve any further whitespace.
+                data_lines.append(raw_line[6:] if raw_line.startswith("data: ") else raw_line[5:])
+
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+if prompt := st.chat_input("Paste your meeting transcription here..."):
+    st.session_state.messages.append({"role": "user", "content": prompt})
+    with st.chat_message("user"):
+        st.markdown(prompt)
+
+    with st.chat_message("assistant"):
+        placeholder = st.empty()
+        full_response = ""
+        try:
+            for chunk in stream_estimation(prompt):
+                full_response += chunk
+                placeholder.markdown(full_response + "▍")
+            placeholder.markdown(full_response)
+        except httpx.HTTPError as exc:
+            full_response = f"Could not reach the estimator at `{STREAM_ENDPOINT}`: {exc}"
+            placeholder.error(full_response)
+        response = full_response
+
+    st.session_state.messages.append({"role": "assistant", "content": response})
+
+
+with st.sidebar:
+    st.header("Service")
+    st.code(STREAM_ENDPOINT, language="text")
+    primary = os.getenv("PRIMARY_MODEL", "gpt-4o-mini")
+    fallback = os.getenv("FALLBACK_MODEL", "claude-haiku-4-5-20251001")
+    st.markdown(f"**Primary model:** `{primary}`")
+    st.markdown(f"**Fallback model:** `{fallback}`")
+    st.markdown(f"**Cache TTL:** `{os.getenv('CACHE_TTL', '86400')}s`")
+    if st.button("Clear chat history"):
         st.session_state.messages = []
-    if "last_metrics" not in st.session_state:
-        st.session_state.last_metrics = None
-
-
-def _render_sidebar(system_prompt: str, settings: Settings) -> None:
-    """Level 3: CAG context visibility (prompt, examples, last-call metrics)."""
-    with st.sidebar:
-        st.header("Contexto CAG")
-        st.caption(f"Proveedor: `{settings.LLM_PROVIDER}` · Modelo: `{settings.LLM_MODEL}`")
-
-        with st.expander("System prompt (solo lectura)", expanded=False):
-            st.code(system_prompt, language="markdown")
-
-        with st.expander("Estimaciones de referencia", expanded=False):
-            for index, example in enumerate(ESTIMATION_EXAMPLES, start=1):
-                st.subheader(f"Ejemplo {index}")
-                st.markdown("**Resumen de la reunión**")
-                st.write(example["meeting_summary"])
-                st.markdown("**Estimación**")
-                st.markdown(example["estimation"])
-
-        st.subheader("Última llamada")
-        metrics: dict[str, Any] | None = st.session_state.last_metrics
-        if not metrics:
-            st.caption("Aún no hay métricas. Envía una transcripción.")
-            return
-        st.metric("Modelo", metrics.get("model") or "—")
-        col_in, col_out = st.columns(2)
-        col_in.metric("Tokens entrada", metrics.get("input_tokens") or "—")
-        col_out.metric("Tokens salida", metrics.get("output_tokens") or "—")
-        latency = metrics.get("latency_ms")
-        st.metric("Latencia (ms)", latency if latency is not None else "—")
-        st.caption(f"Proveedor: {metrics.get('provider') or '—'}")
-
-
-def main() -> None:
-    """Run the Streamlit chat app for meeting-transcription estimations."""
-    st.set_page_config(page_title="Estimador CAG", page_icon="💬", layout="wide")
-    st.title("Estimador de software (CAG)")
-    st.caption(
-        "Pega la transcripción de una reunión y recibe una estimación en streaming. "
-        "Cada mensaje se estima de forma independiente (mismo prompt CAG que el API)."
-    )
-
-    settings = _load_settings()
-    if settings is None:
-        return
-
-    _init_session_state()
-    system_prompt = build_system_prompt()
-    _render_sidebar(system_prompt, settings)
-
-    # snippet: render conversation history
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
-
-    # snippet: accept transcription and stream estimation
-    if prompt := st.chat_input("Pega la transcripción de la reunión..."):
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
-
-        metrics: StreamMetrics = {}
-        with st.chat_message("assistant"):
-            try:
-                response = st.write_stream(
-                    stream_estimation(prompt, settings=settings, metrics=metrics)
-                )
-            except Exception as exc:  # noqa: BLE001 — show provider errors in chat
-                response = f"Error al llamar al LLM: {exc}"
-                st.error(response)
-
-        st.session_state.messages.append({"role": "assistant", "content": str(response)})
-        if metrics:
-            st.session_state.last_metrics = dict(metrics)
-            st.rerun()
-
-
-if __name__ == "__main__":
-    main()
+        st.rerun()
