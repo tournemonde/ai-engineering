@@ -51,7 +51,8 @@ def test_stream_endpoint_emits_token_and_done_events() -> None:
         assert "data: estimator." in body
         assert "event: done" in body
         assert len(stub.calls) == 1
-        assert stub.calls[0]["user_message"] == "x" * 60
+        assert "x" * 60 in stub.calls[0]["user_message"]
+        assert "<project_description>" in stub.calls[0]["user_message"]
     finally:
         app.dependency_overrides.pop(get_llm_wrapper, None)
 

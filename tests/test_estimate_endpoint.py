@@ -81,7 +81,8 @@ def test_two_phase_invokes_llm_twice_and_fills_extracted(
     assert len(call_log) == 2
     # The second call's user message should be the extracted requirements,
     # not the original transcription.
-    assert call_log[1]["user_message"] == body["extracted_requirements"]
+    assert body["extracted_requirements"] in call_log[1]["user_message"]
+    assert "<project_description>" in call_log[1]["user_message"]
 
 
 def test_max_tokens_low_propagates_finish_reason_length(

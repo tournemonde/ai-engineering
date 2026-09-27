@@ -12,9 +12,16 @@ from typing import Any
 
 import structlog
 
-from app.context.examples import format_examples_for_prompt, select_examples
 from app.dependencies import get_llm_wrapper
-from app.schemas.estimation import ExampleFormat, PreprocessingMode
+from app.prompts.loader import render_estimation_prompt
+from app.schemas.estimation import (
+    DetailLevel,
+    EstimationRequest,
+    ExampleFormat,
+    OutputFormat,
+    PreprocessingMode,
+    ProjectType,
+)
 
 log = structlog.get_logger()
 
@@ -90,6 +97,9 @@ class GenerationOptions:
     model: str | None = None
     max_tokens: int = DEFAULT_MAX_TOKENS
     thinking_budget: int | None = None
+    project_type: ProjectType = ProjectType.WEB_SAAS
+    detail_level: DetailLevel = DetailLevel.MEDIUM
+    output_format: OutputFormat = OutputFormat.PHASES_TABLE
 
 
 # ---------------------------------------------------------------------------
@@ -102,33 +112,29 @@ def build_system_prompt(
     num_examples: int = 3,
     use_examples: bool = True,
     inline_cleaning: bool = False,
+    *,
+    description: str = "x" * 50,
+    project_type: ProjectType = ProjectType.WEB_SAAS,
+    detail_level: DetailLevel = DetailLevel.MEDIUM,
+    output_format: OutputFormat = OutputFormat.PHASES_TABLE,
 ) -> str:
-    """Assemble the system prompt with role, rates, output spec and (optionally) examples."""
-    role = (
-        "You are a senior software consultant with 15+ years of experience in project "
-        "estimation. Your task is to produce a detailed software project estimation based "
-        "on a meeting transcription provided by the user."
+    """Assemble the system prompt from the v1 Jinja template.
+
+    Kept as a function so the streaming route and older callers share one entry.
+    The live switch ``ACTIVE_OUTPUT_PROMPT`` is still appended at the end.
+    """
+    request = EstimationRequest.model_construct(
+        transcription=description,
+        preprocessing="inline_cleaning" if inline_cleaning else "none",
+        example_format=example_format,
+        num_examples=num_examples,
+        use_examples=use_examples,
+        project_type=project_type,
+        detail_level=detail_level,
+        output_format=output_format,
     )
-    rates = (
-        "Use a developer rate of approximately 62.50 EUR/hour (500 EUR/day) and a designer "
-        "rate of approximately 50 EUR/hour (400 EUR/day). Provide realistic, well-justified "
-        "numbers."
-    )
-
-    examples_block = ""
-    if use_examples and num_examples > 0:
-        rendered = format_examples_for_prompt(select_examples(num_examples), example_format)
-        if rendered:
-            examples_block = (
-                "Below are reference estimations from previous projects. Use them as a guide "
-                "for structure, level of detail, and realistic pricing. Adapt the content to "
-                "match the specific project described in the transcription.\n\n" + rendered
-            )
-
-    cleaning_block = INLINE_CLEANING_BLOCK if inline_cleaning else ""
-
-    sections = [role, cleaning_block, rates, ACTIVE_OUTPUT_PROMPT, examples_block]
-    return "\n\n".join(s for s in sections if s)
+    system, _user = render_estimation_prompt(request)
+    return f"{system}\n\n{ACTIVE_OUTPUT_PROMPT}"
 
 
 # ---------------------------------------------------------------------------
@@ -211,12 +217,22 @@ def generate_estimation(
         extracted_requirements, prep_usage, prep_cost = extract_requirements(transcription, opts)
         user_input = extracted_requirements
 
-    system_prompt = build_system_prompt(
+    # snippet: product prompt (Jinja) plus the instructor live-switch paragraph
+    prompt_request = EstimationRequest.model_construct(
+        transcription=user_input,
+        preprocessing=opts.preprocessing,
         example_format=opts.example_format,
         num_examples=opts.num_examples,
         use_examples=opts.use_examples,
-        inline_cleaning=(opts.preprocessing == "inline_cleaning"),
+        model=opts.model,
+        max_tokens=opts.max_tokens,
+        thinking_budget=opts.thinking_budget,
+        project_type=opts.project_type,
+        detail_level=opts.detail_level,
+        output_format=opts.output_format,
     )
+    system_prompt, user_message = render_estimation_prompt(prompt_request)
+    system_prompt = f"{system_prompt}\n\n{ACTIVE_OUTPUT_PROMPT}"
 
     log.info(
         "generating_estimation",
@@ -232,7 +248,7 @@ def generate_estimation(
     try:
         result = _invoke_llm(
             system_prompt=system_prompt,
-            user_message=user_input,
+            user_message=user_message,
             model_override=opts.model,
             max_tokens=opts.max_tokens,
             thinking_budget=opts.thinking_budget,

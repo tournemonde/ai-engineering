@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException
 from sse_starlette.sse import EventSourceResponse
 
 from app.dependencies import get_llm_wrapper
+from app.prompts.loader import render_estimation_prompt
 from app.schemas.estimation import (
     EstimationRequest,
     EstimationResponse,
@@ -13,9 +14,9 @@ from app.schemas.estimation import (
 )
 from app.services.evaluation import evaluate_estimation_structure
 from app.services.llm_service import (
+    ACTIVE_OUTPUT_PROMPT,
     GenerationOptions,
     LLMServiceError,
-    build_system_prompt,
     generate_estimation,
 )
 from app.services.llm_wrapper import LLMWrapper
@@ -36,6 +37,9 @@ async def create_estimation(request: EstimationRequest) -> EstimationResponse:
         model=request.model,
         max_tokens=request.max_tokens,
         thinking_budget=request.thinking_budget,
+        project_type=request.project_type,
+        detail_level=request.detail_level,
+        output_format=request.output_format,
     )
 
     try:
@@ -65,13 +69,22 @@ async def create_estimation_stream(
     benefit of streaming (intermediate phase 1 tokens would leak; validation
     only makes sense over the complete text).
     """
-    system_prompt = build_system_prompt()
+    prompt_request = EstimationRequest(
+        transcription=request.transcription,
+        project_type=request.project_type,
+        detail_level=request.detail_level,
+        output_format=request.output_format,
+        model=request.model,
+        max_tokens=request.max_tokens,
+    )
+    system_prompt, user_message = render_estimation_prompt(prompt_request)
+    system_prompt = f"{system_prompt}\n\n{ACTIVE_OUTPUT_PROMPT}"
 
     async def event_generator() -> AsyncIterator[dict]:
         loop = asyncio.get_running_loop()
         chunks = wrapper.complete_stream(
             system_prompt=system_prompt,
-            user_message=request.transcription,
+            user_message=user_message,
             model_override=request.model,
             max_tokens=request.max_tokens,
         )

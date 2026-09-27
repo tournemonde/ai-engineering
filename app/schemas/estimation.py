@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Literal
 
 from pydantic import BaseModel, Field
@@ -6,10 +7,40 @@ PreprocessingMode = Literal["none", "inline_cleaning", "two_phase"]
 ExampleFormat = Literal["markdown", "json", "narrative"]
 
 
+class ProjectType(str, Enum):
+    """Kind of software project the estimator is pricing."""
+
+    MOBILE_APP = "mobile_app"
+    WEB_SAAS = "web_saas"
+    INTERNAL_TOOL = "internal_tool"
+    DATA_PIPELINE = "data_pipeline"
+
+
+class DetailLevel(str, Enum):
+    """How much detail the prompt asks the model to produce."""
+
+    SUMMARY = "summary"
+    MEDIUM = "medium"
+    DETAILED = "detailed"
+
+
+class OutputFormat(str, Enum):
+    """Shape of the estimation the prompt asks the model to write."""
+
+    PHASES_TABLE = "phases_table"
+    LINE_ITEMS = "line_items"
+    NARRATIVE = "narrative"
+
+
 class EstimationRequest(BaseModel):
     """Incoming request containing a meeting transcription to estimate."""
 
     transcription: str = Field(..., min_length=50, description="Meeting transcription text")
+
+    # snippet: product parameters (session 4). Defaults keep session 3 payloads valid.
+    project_type: ProjectType = ProjectType.WEB_SAAS
+    detail_level: DetailLevel = DetailLevel.MEDIUM
+    output_format: OutputFormat = OutputFormat.PHASES_TABLE
 
     preprocessing: PreprocessingMode = Field(
         default="none",
@@ -105,5 +136,8 @@ class StreamEstimationRequest(BaseModel):
     """Streaming endpoint request — only the transcription, knobs are not exposed."""
 
     transcription: str = Field(..., min_length=50, description="Meeting transcription text")
+    project_type: ProjectType = ProjectType.WEB_SAAS
+    detail_level: DetailLevel = DetailLevel.MEDIUM
+    output_format: OutputFormat = OutputFormat.PHASES_TABLE
     model: str | None = Field(default=None, description="Override the default model")
     max_tokens: int = Field(default=4000, gt=0, le=16000)
