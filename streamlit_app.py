@@ -2,8 +2,11 @@
 
 Creates a session on load, posts multipart estimates to
 ``POST /sessions/{id}/estimate``, shows ``project_metadata`` in the sidebar,
-and offers a "Nueva conversación" reset. The transactional
-``POST /api/v1/estimate`` endpoint remains available for API clients.
+and offers a "Nueva conversación" reset.
+
+The main area is chat-like: prior turns + a small composer (text + attachments).
+Typed estimate options (project_type / detail_level / output_format) live in the
+sidebar so they do not dominate the conversation UI.
 """
 
 from __future__ import annotations
@@ -54,28 +57,28 @@ def _reset_session() -> None:
 
 
 def _render_estimation(result: dict[str, Any]) -> None:
-    """Render a structured EstimationResult defensively (no KeyError mid-page)."""
-    st.subheader("Estimation")
+    """Render a structured EstimationResult (summary + phases table)."""
     summary = result.get("summary") or "(no summary)"
-    # Plain text avoids rare markdown/HTML edge cases freezing the frontend.
     st.text(summary)
-    st.markdown(
-        f"**Total:** {result.get('total_duration_weeks', '?')} weeks · "
-        f"{result.get('total_cost_eur', '?')} EUR · "
-        f"confidence {result.get('confidence_pct', '?')}%"
-    )
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Duration", f"{result.get('total_duration_weeks', '?')} wk")
+    c2.metric("Cost", f"{result.get('total_cost_eur', '?')} EUR")
+    c3.metric("Confidence", f"{result.get('confidence_pct', '?')}%")
+
     phases = result.get("phases") or []
-    if not phases:
-        return
-    st.markdown("**Phases**")
-    for phase in phases:
-        if not isinstance(phase, dict):
-            continue
-        name = phase.get("name", "?")
-        weeks = phase.get("duration_weeks", "?")
-        cost = phase.get("cost_eur", "?")
-        phase_summary = phase.get("summary", "")
-        st.markdown(f"- **{name}** — {weeks}w / {cost} EUR — {phase_summary}")
+    rows = [
+        {
+            "Phase": phase.get("name", "?"),
+            "Weeks": phase.get("duration_weeks", "?"),
+            "Cost (EUR)": phase.get("cost_eur", "?"),
+            "Summary": phase.get("summary", ""),
+        }
+        for phase in phases
+        if isinstance(phase, dict)
+    ]
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
 
 
 def _metadata_is_empty(metadata: dict[str, Any]) -> bool:
@@ -90,8 +93,8 @@ def _metadata_is_empty(metadata: dict[str, Any]) -> bool:
 st.set_page_config(page_title="Software Estimator", page_icon="📊")
 st.title("Software Estimator")
 st.caption(
-    "Conversational estimation with session memory and optional PDF/DOCX attachments. "
-    "Write a follow-up in the box at the bottom after each estimate."
+    "Refine the estimate in the box below, or attach PDF/DOCX specs. "
+    "Project type and format options stay in the sidebar."
 )
 
 _ensure_session()
@@ -100,7 +103,47 @@ if st.session_state.get("last_error") and not st.session_state.get("session_id")
     st.error(st.session_state.last_error)
     st.stop()
 
-# --- Prior turns (above the composer, chat-like) ----------------------------
+# Sidebar first so the composer can reuse the typed options.
+with st.sidebar:
+    st.header("Session")
+    st.code(st.session_state.get("session_id") or "(none)", language="text")
+    if st.button("Nueva conversación"):
+        _reset_session()
+        st.rerun()
+
+    st.header("Estimate options")
+    project_type = st.selectbox(
+        "Project type",
+        options=[t.value for t in ProjectType],
+        index=1,
+    )
+    detail_level = st.selectbox(
+        "Detail level",
+        options=[d.value for d in DetailLevel],
+        index=1,
+    )
+    output_format = st.selectbox(
+        "Output format",
+        options=[f.value for f in OutputFormat],
+        index=0,
+    )
+
+    st.header("Project metadata")
+    metadata = st.session_state.get("project_metadata") or {}
+    if _metadata_is_empty(metadata):
+        st.caption("Empty — first turn of the session.")
+    else:
+        st.json(metadata)
+
+    st.header("Service")
+    st.code(SESSIONS_ENDPOINT, language="text")
+    primary = os.getenv("PRIMARY_MODEL", "gpt-4o-mini")
+    fallback = os.getenv("FALLBACK_MODEL", "claude-haiku-4-5-20251001")
+    st.markdown(f"**Primary model:** `{primary}`")
+    st.markdown(f"**Fallback model:** `{fallback}`")
+    st.markdown(f"**Max turns:** `{os.getenv('MAX_CONVERSATION_TURNS', '6')}`")
+
+# --- Prior turns ------------------------------------------------------------
 turns: list[dict[str, Any]] = st.session_state.get("turns") or []
 if turns:
     st.header("Conversation")
@@ -114,47 +157,28 @@ if turns:
 if st.session_state.get("last_error"):
     st.error(st.session_state.last_error)
 
-# --- Composer always at the bottom so the next message is obvious ----------
-st.header("Next message")
-with st.form("estimation_form", clear_on_submit=True):
+# --- Minimal composer: text + attachments only ------------------------------
+st.divider()
+with st.form("composer", clear_on_submit=True):
     transcript = st.text_area(
-        "Transcript / refinement",
-        height=160,
-        placeholder="Describe the project, or refine the previous turn…",
-        help="At least 20 characters. Attachments enrich this turn's context.",
+        "Message",
+        height=140,
+        placeholder="Refine the estimate, add scope, or describe the project…",
+        label_visibility="collapsed",
     )
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        project_type = st.selectbox(
-            "Project type",
-            options=[t.value for t in ProjectType],
-            index=1,
-        )
-    with col_b:
-        detail_level = st.selectbox(
-            "Detail level",
-            options=[d.value for d in DetailLevel],
-            index=1,
-        )
-    with col_c:
-        output_format = st.selectbox(
-            "Output format",
-            options=[f.value for f in OutputFormat],
-            index=0,
-        )
     attachments = st.file_uploader(
-        "Attachments (PDF or DOCX)",
+        "Attach PDF or DOCX (optional)",
         type=["pdf", "docx"],
         accept_multiple_files=True,
     )
-    submitted = st.form_submit_button("Estimate / refine", type="primary")
+    submitted = st.form_submit_button("Send", type="primary")
 
 if submitted:
     if st.session_state.session_id is None:
         st.session_state.last_error = "No active session. Click Nueva conversación."
         st.rerun()
     if len(transcript.strip()) < 20:
-        st.session_state.last_error = "The transcript must be at least 20 characters long."
+        st.session_state.last_error = "The message must be at least 20 characters long."
         st.rerun()
 
     files = [
@@ -202,27 +226,4 @@ if submitted:
             "result": body.get("result") or {},
         },
     ]
-    # Fresh run: form is idle again (avoids Streamlit "stuck after submit" UI).
     st.rerun()
-
-with st.sidebar:
-    st.header("Session")
-    st.code(st.session_state.get("session_id") or "(none)", language="text")
-    if st.button("Nueva conversación"):
-        _reset_session()
-        st.rerun()
-
-    st.header("Project metadata")
-    metadata = st.session_state.get("project_metadata") or {}
-    if _metadata_is_empty(metadata):
-        st.caption("Empty — first turn of the session.")
-    else:
-        st.json(metadata)
-
-    st.header("Service")
-    st.code(SESSIONS_ENDPOINT, language="text")
-    primary = os.getenv("PRIMARY_MODEL", "gpt-4o-mini")
-    fallback = os.getenv("FALLBACK_MODEL", "claude-haiku-4-5-20251001")
-    st.markdown(f"**Primary model:** `{primary}`")
-    st.markdown(f"**Fallback model:** `{fallback}`")
-    st.markdown(f"**Max turns:** `{os.getenv('MAX_CONVERSATION_TURNS', '6')}`")
