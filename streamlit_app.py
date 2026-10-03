@@ -1,12 +1,12 @@
 """Streamlit conversational client for the Session 5 estimator.
 
-Creates a session on load, posts multipart estimates to
-``POST /sessions/{id}/estimate``, shows ``project_metadata`` in the sidebar,
-and offers a "Nueva conversación" reset.
-
-The main area is chat-like: prior turns + a small composer (text + attachments).
-Typed estimate options (project_type / detail_level / output_format) live in the
-sidebar so they do not dominate the conversation UI.
+UI states
+---------
+1. First interaction (no turns yet): full typed form at the top
+   (transcript + project_type + detail_level + output_format + attachments).
+2. After the first successful estimate: hide the typed form; show the
+   conversation history and a small composer (text + optional attachments)
+   to refine the estimate. Typed options stay in session_state from turn 1.
 """
 
 from __future__ import annotations
@@ -40,6 +40,9 @@ def _ensure_session() -> None:
             st.session_state.last_result = None
             st.session_state.last_error = None
             st.session_state.turns = []
+            st.session_state.project_type = ProjectType.WEB_SAAS.value
+            st.session_state.detail_level = DetailLevel.MEDIUM.value
+            st.session_state.output_format = OutputFormat.PHASES_TABLE.value
         except httpx.HTTPError as exc:
             st.session_state.session_id = None
             st.session_state.last_error = f"Could not create session: {exc}"
@@ -52,6 +55,10 @@ def _reset_session() -> None:
         st.session_state.last_result = None
         st.session_state.last_error = None
         st.session_state.turns = []
+        # Keep last typed options; user can reset via Nueva conversación + full form.
+        st.session_state.project_type = ProjectType.WEB_SAAS.value
+        st.session_state.detail_level = DetailLevel.MEDIUM.value
+        st.session_state.output_format = OutputFormat.PHASES_TABLE.value
     except httpx.HTTPError as exc:
         st.session_state.last_error = f"Could not reset session: {exc}"
 
@@ -90,90 +97,10 @@ def _metadata_is_empty(metadata: dict[str, Any]) -> bool:
     )
 
 
-st.set_page_config(page_title="Software Estimator", page_icon="📊")
-st.title("Software Estimator")
-st.caption(
-    "Refine the estimate in the box below, or attach PDF/DOCX specs. "
-    "Project type and format options stay in the sidebar."
-)
+def _post_estimate(*, transcript: str, attachments: list[Any] | None) -> None:
+    """POST one turn, append to history, then rerun."""
+    turns: list[dict[str, Any]] = list(st.session_state.get("turns") or [])
 
-_ensure_session()
-
-if st.session_state.get("last_error") and not st.session_state.get("session_id"):
-    st.error(st.session_state.last_error)
-    st.stop()
-
-# Sidebar first so the composer can reuse the typed options.
-with st.sidebar:
-    st.header("Session")
-    st.code(st.session_state.get("session_id") or "(none)", language="text")
-    if st.button("Nueva conversación"):
-        _reset_session()
-        st.rerun()
-
-    st.header("Estimate options")
-    project_type = st.selectbox(
-        "Project type",
-        options=[t.value for t in ProjectType],
-        index=1,
-    )
-    detail_level = st.selectbox(
-        "Detail level",
-        options=[d.value for d in DetailLevel],
-        index=1,
-    )
-    output_format = st.selectbox(
-        "Output format",
-        options=[f.value for f in OutputFormat],
-        index=0,
-    )
-
-    st.header("Project metadata")
-    metadata = st.session_state.get("project_metadata") or {}
-    if _metadata_is_empty(metadata):
-        st.caption("Empty — first turn of the session.")
-    else:
-        st.json(metadata)
-
-    st.header("Service")
-    st.code(SESSIONS_ENDPOINT, language="text")
-    primary = os.getenv("PRIMARY_MODEL", "gpt-4o-mini")
-    fallback = os.getenv("FALLBACK_MODEL", "claude-haiku-4-5-20251001")
-    st.markdown(f"**Primary model:** `{primary}`")
-    st.markdown(f"**Fallback model:** `{fallback}`")
-    st.markdown(f"**Max turns:** `{os.getenv('MAX_CONVERSATION_TURNS', '6')}`")
-
-# --- Prior turns ------------------------------------------------------------
-turns: list[dict[str, Any]] = st.session_state.get("turns") or []
-if turns:
-    st.header("Conversation")
-    for idx, turn in enumerate(turns, start=1):
-        with st.expander(f"Turn {idx}", expanded=(idx == len(turns))):
-            st.caption("You")
-            st.text(turn.get("transcript", ""))
-            st.caption(f"Prompt `{turn.get('prompt_version', '?')}` · cached={turn.get('cached')}")
-            _render_estimation(turn.get("result") or {})
-
-if st.session_state.get("last_error"):
-    st.error(st.session_state.last_error)
-
-# --- Minimal composer: text + attachments only ------------------------------
-st.divider()
-with st.form("composer", clear_on_submit=True):
-    transcript = st.text_area(
-        "Message",
-        height=140,
-        placeholder="Refine the estimate, add scope, or describe the project…",
-        label_visibility="collapsed",
-    )
-    attachments = st.file_uploader(
-        "Attach PDF or DOCX (optional)",
-        type=["pdf", "docx"],
-        accept_multiple_files=True,
-    )
-    submitted = st.form_submit_button("Send", type="primary")
-
-if submitted:
     if st.session_state.session_id is None:
         st.session_state.last_error = "No active session. Click Nueva conversación."
         st.rerun()
@@ -190,9 +117,9 @@ if submitted:
     ]
     data = {
         "transcript": transcript.strip(),
-        "project_type": project_type,
-        "detail_level": detail_level,
-        "output_format": output_format,
+        "project_type": st.session_state.project_type,
+        "detail_level": st.session_state.detail_level,
+        "output_format": st.session_state.output_format,
     }
     endpoint = f"{SESSIONS_ENDPOINT}/{st.session_state.session_id}/estimate"
     with st.spinner("Calling the estimator service…"):
@@ -227,3 +154,118 @@ if submitted:
         },
     ]
     st.rerun()
+
+
+st.set_page_config(page_title="Software Estimator", page_icon="📊")
+st.title("Software Estimator")
+
+_ensure_session()
+
+if st.session_state.get("last_error") and not st.session_state.get("session_id"):
+    st.error(st.session_state.last_error)
+    st.stop()
+
+turns: list[dict[str, Any]] = st.session_state.get("turns") or []
+has_conversation = len(turns) > 0
+
+with st.sidebar:
+    st.header("Session")
+    st.code(st.session_state.get("session_id") or "(none)", language="text")
+    if st.button("Nueva conversación"):
+        _reset_session()
+        st.rerun()
+
+    if has_conversation:
+        st.caption("Typed options locked from turn 1:")
+        st.markdown(f"**Project type:** `{st.session_state.project_type}`")
+        st.markdown(f"**Detail level:** `{st.session_state.detail_level}`")
+        st.markdown(f"**Output format:** `{st.session_state.output_format}`")
+
+    st.header("Project metadata")
+    metadata = st.session_state.get("project_metadata") or {}
+    if _metadata_is_empty(metadata):
+        st.caption("Empty — first turn of the session.")
+    else:
+        st.json(metadata)
+
+    st.header("Service")
+    st.code(SESSIONS_ENDPOINT, language="text")
+    st.markdown(f"**Primary model:** `{os.getenv('PRIMARY_MODEL', 'gpt-4o-mini')}`")
+    st.markdown(f"**Fallback model:** `{os.getenv('FALLBACK_MODEL', 'claude-haiku-4-5-20251001')}`")
+    st.markdown(f"**Max turns:** `{os.getenv('MAX_CONVERSATION_TURNS', '6')}`")
+
+if st.session_state.get("last_error"):
+    st.error(st.session_state.last_error)
+
+# --- State 1: first interaction — full typed form at the top ----------------
+if not has_conversation:
+    st.caption(
+        "Fill in the typed form to produce the first estimate. "
+        "After that you can refine with a short message or attachments."
+    )
+    with st.form("initial_estimation_form", clear_on_submit=False):
+        transcript = st.text_area(
+            "Project description / transcript",
+            height=200,
+            placeholder="Describe the project: goals, key features, constraints…",
+            help="Between 20 and 80000 characters.",
+        )
+        project_type = st.selectbox(
+            "Project type",
+            options=[t.value for t in ProjectType],
+            index=1,
+        )
+        detail_level = st.radio(
+            "Detail level",
+            options=[d.value for d in DetailLevel],
+            index=1,
+            horizontal=True,
+        )
+        output_format = st.selectbox(
+            "Output format",
+            options=[f.value for f in OutputFormat],
+            index=0,
+        )
+        attachments = st.file_uploader(
+            "Attachments (PDF or DOCX)",
+            type=["pdf", "docx"],
+            accept_multiple_files=True,
+        )
+        submitted = st.form_submit_button("Generate estimation", type="primary")
+
+    if submitted:
+        st.session_state.project_type = project_type
+        st.session_state.detail_level = detail_level
+        st.session_state.output_format = output_format
+        _post_estimate(transcript=transcript, attachments=attachments)
+
+# --- State 2: conversation started — results + refine box only --------------
+else:
+    st.caption(
+        "Refine the estimate below, or attach PDF/DOCX. "
+        "Typed options stay as in the first turn (see sidebar)."
+    )
+    st.header("Conversation")
+    for idx, turn in enumerate(turns, start=1):
+        with st.expander(f"Turn {idx}", expanded=(idx == len(turns))):
+            st.caption("You")
+            st.text(turn.get("transcript", ""))
+            st.caption(f"Prompt `{turn.get('prompt_version', '?')}` · cached={turn.get('cached')}")
+            _render_estimation(turn.get("result") or {})
+
+    st.divider()
+    with st.form("refine_composer", clear_on_submit=True):
+        transcript = st.text_area(
+            "Continue the conversation",
+            height=120,
+            placeholder="Refine scope, correct assumptions, or add details…",
+        )
+        attachments = st.file_uploader(
+            "Attachments (PDF or DOCX)",
+            type=["pdf", "docx"],
+            accept_multiple_files=True,
+        )
+        submitted = st.form_submit_button("Send", type="primary")
+
+    if submitted:
+        _post_estimate(transcript=transcript, attachments=attachments)
