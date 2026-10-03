@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main, "session2/**", "session3/**", "session4/**"]
+    branches: [main, "session2/**", "session3/**", "session4/**", "session5/**"]
   pull_request:
     branches: [main]
 
