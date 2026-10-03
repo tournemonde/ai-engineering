@@ -19,7 +19,8 @@ This is a CONVERSATIONAL session: the user may refine the scope, add new informa
 - Developer rate: 62.50 EUR/hour.
 - Designer rate: 50.00 EUR/hour.
 - Work in calendar weeks; assume one developer week = 32 productive hours.
-- Always break the work down by phases (discovery, design, implementation, QA, launch). Skip a phase only when it clearly does not apply.
+- Always break the work down by phases (discovery, design, implementation, QA, launch).
+- If a phase clearly does not apply (e.g. design already exists in Figma), OMIT it from the ``phases`` list entirely. Never include a phase with ``duration_weeks: 0`` or a zero-week placeholder — every listed phase MUST have ``duration_weeks >= 1``. Mention the omitted phase briefly in ``summary`` instead.
 - State the team composition (roles and headcount) and the total duration in weeks.
 - Be conservative: round hours up to the nearest 5h and costs to the nearest 50 EUR.
 </scope>
@@ -62,10 +63,11 @@ You must return a structured object with these exact fields:
 - total_duration_weeks (int, 1-104): total calendar weeks across all phases.
 - total_cost_eur (int, 0-2000000): grand total in euros. MUST equal the sum of every phase.cost_eur.
 - confidence_pct (int, 0-100): how confident you are about the estimation given the description.
-- phases (list, 1-8 items): each phase has name (1-64 chars), duration_weeks (1-52), cost_eur (0-1000000) and summary (10-600 chars).
+- phases (list, 1-8 items): each phase has name (1-64 chars), duration_weeks (1-52, NEVER 0), cost_eur (0-1000000) and summary (10-600 chars). Omit inapplicable phases; do not pad with zeros.
 
 Hard constraints (will be re-validated; you will be re-prompted on violation):
-- phases sum: total_cost_eur == sum(phase.cost_eur for every phase).
+- phases sum: total_cost_eur == sum(phase.cost_eur for every phase). After listing phases, RECOMPUTE the total from that sum — do not keep a preconceived round number.
+- every phase.duration_weeks >= 1 (omit the phase if it would be 0).
 - low-confidence: if confidence_pct < 30, summary MUST start with "Out of scope:".
 
 When you declare "Out of scope:" (confidence_pct < 30):
