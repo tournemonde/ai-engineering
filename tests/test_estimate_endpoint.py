@@ -1,135 +1,106 @@
-from collections.abc import Iterator
+"""End-to-end tests for POST /api/v1/estimate (structured output).
+
+The pipeline is mocked at the ``EstimationService`` level: the test swaps the
+real service for a fake whose ``estimate`` records the request it received and
+returns a canned ``EstimationResponse``. This isolates the endpoint from
+network access while still exercising request validation and response shaping.
+"""
+
+from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.context.examples import CANONICAL_EXAMPLES
-from app.services import llm_service
+from app.dependencies import get_estimation_service
+from app.main import app
+from app.schemas.estimation import EstimationRequest, EstimationResponse, EstimationResult
 
-WELL_FORMED_MD = CANONICAL_EXAMPLES[0].estimation_markdown
+
+def _canned_result() -> EstimationResult:
+    return EstimationResult(
+        summary="Mid-sized B2B SaaS for equipment loans across teams.",
+        total_duration_weeks=8,
+        total_cost_eur=30_000,
+        confidence_pct=70,
+        phases=[
+            {"name": "Discovery", "duration_weeks": 1, "cost_eur": 5_000,
+             "summary": "Workshops, scoping and tech spike."},
+            {"name": "Implementation", "duration_weeks": 6, "cost_eur": 20_000,
+             "summary": "Build the core SaaS features."},
+            {"name": "QA + launch", "duration_weeks": 1, "cost_eur": 5_000,
+             "summary": "Test pass and production rollout."},
+        ],
+    )
 
 
-def _fake_response(*, estimation: str = WELL_FORMED_MD, finish_reason: str = "stop") -> dict:
-    return {
-        "estimation": estimation,
-        "model": "gpt-4o-mini",
-        "provider": "openai",
-        "finish_reason": finish_reason,
-        "usage": {"input_tokens": 1234, "output_tokens": 567, "total_tokens": 1801},
-        "latency_ms": 12,
-        "cost_usd": 0.001234,
-        "cache_hit": False,
-    }
+class FakeEstimationService:
+    """Records the request and returns a canned response."""
+
+    def __init__(self) -> None:
+        self.calls: list[EstimationRequest] = []
+
+    def estimate(self, request: EstimationRequest) -> EstimationResponse:
+        self.calls.append(request)
+        return EstimationResponse(
+            result=_canned_result(), prompt_version="v1", cached=False
+        )
 
 
 @pytest.fixture
-def call_log(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[dict]]:
-    """Replace the LLM seam with a recording fake. Returns the list of calls."""
-    calls: list[dict] = []
-
-    def fake(
-        *,
-        system_prompt: str,
-        user_message: str,
-        model_override: str | None,
-        max_tokens: int,
-        thinking_budget: int | None,
-    ) -> dict:
-        calls.append(
-            {
-                "system_prompt": system_prompt,
-                "user_message": user_message,
-                "model_override": model_override,
-                "max_tokens": max_tokens,
-                "thinking_budget": thinking_budget,
-            }
-        )
-        finish_reason = "length" if max_tokens <= 200 else "stop"
-        return _fake_response(finish_reason=finish_reason)
-
-    monkeypatch.setattr(llm_service, "_invoke_llm", fake)
-    yield calls
+def fake_service() -> FakeEstimationService:
+    svc = FakeEstimationService()
+    app.dependency_overrides[get_estimation_service] = lambda: svc
+    yield svc
+    app.dependency_overrides.pop(get_estimation_service, None)
 
 
-def test_default_request_returns_validation(client: TestClient, call_log: list[dict]) -> None:
-    payload = {"transcription": "We need a small CRM with auth, contacts and roles. MVP six weeks."}
-    response = client.post("/api/v1/estimate", json=payload)
-    assert response.status_code == 200
-    body = response.json()
-    assert body["preprocessing"] == "none"
-    assert body["finish_reason"] == "stop"
-    assert body["validation"] is not None
-    assert body["validation"]["score"] == 1.0
-    assert body["extracted_requirements"] is None
-    assert body["cache_hit"] is False
-    assert body["cost_usd"] == pytest.approx(0.001234)
-    assert len(call_log) == 1
+VALID_PAYLOAD = {
+    "description": "A small B2B SaaS to manage employee equipment loans across teams.",
+    "project_type": "web_saas",
+    "detail_level": "medium",
+    "output_format": "phases_table",
+}
 
 
-def test_two_phase_invokes_llm_twice_and_fills_extracted(
-    client: TestClient, call_log: list[dict]
+def test_valid_payload_returns_structured_response(
+    client: TestClient, fake_service: FakeEstimationService
 ) -> None:
-    payload = {
-        "transcription": "We need a small CRM with auth, contacts and roles. MVP six weeks.",
-        "preprocessing": "two_phase",
-    }
-    response = client.post("/api/v1/estimate", json=payload)
+    response = client.post("/api/v1/estimate", json=VALID_PAYLOAD)
     assert response.status_code == 200
     body = response.json()
-    assert body["preprocessing"] == "two_phase"
-    assert body["extracted_requirements"] is not None
-    assert len(call_log) == 2
-    # The second call's user message should be the extracted requirements,
-    # not the original transcription.
-    assert body["extracted_requirements"] in call_log[1]["user_message"]
-    assert "<project_description>" in call_log[1]["user_message"]
+    assert body["prompt_version"] == "v1"
+    assert body["cached"] is False
+    assert body["result"]["total_cost_eur"] == 30_000
+    assert body["result"]["confidence_pct"] == 70
+    assert len(body["result"]["phases"]) == 3
+    assert body["result"]["phases"][0]["name"] == "Discovery"
 
 
-def test_max_tokens_low_propagates_finish_reason_length(
-    client: TestClient, call_log: list[dict]
+def test_endpoint_forwards_request_to_service(
+    client: TestClient, fake_service: FakeEstimationService
 ) -> None:
-    payload = {
-        "transcription": "We need a small CRM with auth, contacts and roles. MVP six weeks.",
-        "max_tokens": 200,
-    }
+    client.post("/api/v1/estimate", json=VALID_PAYLOAD)
+    assert len(fake_service.calls) == 1
+    received = fake_service.calls[0]
+    assert received.description == VALID_PAYLOAD["description"]
+    assert received.project_type.value == "web_saas"
+
+
+def test_missing_project_type_returns_422(client: TestClient, fake_service) -> None:
+    payload = {k: v for k, v in VALID_PAYLOAD.items() if k != "project_type"}
     response = client.post("/api/v1/estimate", json=payload)
-    assert response.status_code == 200
-    body = response.json()
-    assert body["finish_reason"] == "length"
-    assert body["validation"]["finish_reason_ok"] is False
-    assert any("truncated" in m.lower() for m in body["validation"]["issues"])
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    assert any(err["loc"][-1] == "project_type" for err in detail)
 
 
-def test_example_format_json_returns_200(client: TestClient, call_log: list[dict]) -> None:
-    payload = {
-        "transcription": "We need a small CRM with auth, contacts and roles. MVP six weeks.",
-        "example_format": "json",
-        "num_examples": 2,
-    }
+def test_invalid_enum_value_returns_422(client: TestClient, fake_service) -> None:
+    payload = {**VALID_PAYLOAD, "project_type": "not_a_real_enum"}
     response = client.post("/api/v1/estimate", json=payload)
-    assert response.status_code == 200
-    body = response.json()
-    assert body["usage"]["input_tokens"] > 0
-    assert "Reference examples (JSON):" in call_log[0]["system_prompt"]
+    assert response.status_code == 422
 
 
-def test_model_override_is_passed_to_provider(client: TestClient, call_log: list[dict]) -> None:
-    payload = {
-        "transcription": "We need a small CRM with auth, contacts and roles. MVP six weeks.",
-        "model": "gpt-4o",
-    }
+def test_short_description_returns_422(client: TestClient, fake_service) -> None:
+    payload = {**VALID_PAYLOAD, "description": "too short"}
     response = client.post("/api/v1/estimate", json=payload)
-    assert response.status_code == 200
-    assert call_log[0]["model_override"] == "gpt-4o"
-
-
-def test_use_examples_false_omits_examples_block(client: TestClient, call_log: list[dict]) -> None:
-    payload = {
-        "transcription": "We need a small CRM with auth, contacts and roles. MVP six weeks.",
-        "use_examples": False,
-    }
-    response = client.post("/api/v1/estimate", json=payload)
-    assert response.status_code == 200
-    system_prompt = call_log[0]["system_prompt"]
-    assert "EXAMPLE 1" not in system_prompt
-    assert "Reference examples" not in system_prompt
+    assert response.status_code == 422

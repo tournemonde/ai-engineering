@@ -1,4 +1,9 @@
-"""Render versioned Jinja prompt templates for the estimator."""
+"""Jinja2 loader for versioned prompt templates.
+
+The on-disk layout is ``app/prompts/<use_case>/<version>/<role>.j2``. Versioning
+is required from day one: switching prompts becomes a string change at the
+call site (``version="v2"``), not a code refactor.
+"""
 
 from __future__ import annotations
 
@@ -6,18 +11,17 @@ from pathlib import Path
 
 from jinja2 import Environment, FileSystemLoader, StrictUndefined
 
-from app.context.examples import format_examples_for_prompt, select_examples
 from app.schemas.estimation import EstimationRequest
 
-PROMPTS_DIR = Path(__file__).parent
+_BASE_DIR = Path(__file__).resolve().parent
 
-# snippet: fail on missing variables instead of rendering them as empty strings
 _env = Environment(
-    loader=FileSystemLoader(PROMPTS_DIR),
+    loader=FileSystemLoader(_BASE_DIR),
+    undefined=StrictUndefined,
     trim_blocks=True,
     lstrip_blocks=True,
-    keep_trailing_newline=False,
-    undefined=StrictUndefined,
+    autoescape=False,
+    keep_trailing_newline=True,
 )
 
 
@@ -25,29 +29,18 @@ def render_estimation_prompt(
     request: EstimationRequest,
     version: str = "v1",
 ) -> tuple[str, str]:
-    """Return (system, user) text for one estimation call.
+    """Render the system and user prompts for the estimation use case.
 
-    ``version`` selects ``estimation/<version>/`` so a later v2 can be rendered
-    without changing callers.
+    Returns:
+        A tuple ``(system_prompt, user_prompt)`` ready to be sent to the LLM
+        as separate ``role: "system"`` and ``role: "user"`` messages.
     """
-    system = _env.get_template(f"estimation/{version}/system.j2")
-    user = _env.get_template(f"estimation/{version}/user.j2")
-
-    reference_examples = ""
-    if request.use_examples and request.num_examples > 0:
-        reference_examples = format_examples_for_prompt(
-            select_examples(request.num_examples),
-            request.example_format,
-        )
-
     context = {
-        "description": request.transcription,
+        "description": request.description,
         "project_type": request.project_type.value,
         "detail_level": request.detail_level.value,
         "output_format": request.output_format.value,
-        "use_examples": request.use_examples,
-        "inline_cleaning": request.preprocessing == "inline_cleaning",
-        "reference_examples": reference_examples,
     }
-
-    return system.render(**context), user.render(**context)
+    system = _env.get_template(f"estimation/{version}/system.j2").render(**context)
+    user = _env.get_template(f"estimation/{version}/user.j2").render(**context)
+    return system, user

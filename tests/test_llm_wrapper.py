@@ -8,9 +8,7 @@ from app.services.cache import EstimationCache
 from app.services.llm_wrapper import LLMWrapper, _estimate_cost
 
 
-def _fake_completion(
-    model: str, content: str = "the answer", input_tokens: int = 100, output_tokens: int = 50
-):
+def _fake_completion(model: str, content: str = "the answer", input_tokens: int = 100, output_tokens: int = 50):
     """Build a SimpleNamespace shaped like a litellm.ModelResponse."""
     return SimpleNamespace(
         model=model,
@@ -84,10 +82,8 @@ def test_complete_returns_normalised_dict_and_caches(wrapper: LLMWrapper) -> Non
 
 def test_complete_with_model_override_bypasses_router(wrapper: LLMWrapper) -> None:
     fake = _fake_completion(model="gpt-4o", content="overridden")
-    with (
-        patch("app.services.llm_wrapper.litellm.completion", return_value=fake) as direct,
-        patch.object(wrapper.router, "completion") as router_call,
-    ):
+    with patch("app.services.llm_wrapper.litellm.completion", return_value=fake) as direct, \
+        patch.object(wrapper.router, "completion") as router_call:
         result = wrapper.complete(
             system_prompt="sys",
             user_message="usr",
@@ -130,32 +126,8 @@ def test_thinking_budget_pads_max_tokens_when_anthropic_override(wrapper: LLMWra
     assert kwargs["max_tokens"] == 4096 + 1024
 
 
-def test_complete_stream_yields_chunks_and_caches(wrapper: LLMWrapper) -> None:
-    chunks = [
-        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="Hello "))]),
-        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content="world"))]),
-        SimpleNamespace(choices=[SimpleNamespace(delta=SimpleNamespace(content=None))]),
-    ]
-    with patch.object(wrapper.router, "completion", return_value=iter(chunks)):
-        emitted = list(
-            wrapper.complete_stream(
-                system_prompt="sys",
-                user_message="usr",
-                model_override=None,
-                max_tokens=4000,
-            )
-        )
-    assert "".join(emitted) == "Hello world"
-
-    # Now the same request hits the cache and replays the full text as one chunk.
-    with patch.object(wrapper.router, "completion") as router_call:
-        replayed = list(
-            wrapper.complete_stream(
-                system_prompt="sys",
-                user_message="usr",
-                model_override=None,
-                max_tokens=4000,
-            )
-        )
-    assert router_call.call_count == 0
-    assert "".join(replayed) == "Hello world"
+# test_complete_stream_yields_chunks_and_caches was removed in Session 4 when
+# the /api/v1/estimate/stream endpoint and the wrapper's complete_stream() method
+# were deleted. Structured output via Instructor (complete_structured) replaces
+# token streaming; tests for that path live in test_estimate_endpoint.py with a
+# mocked EstimationService.
