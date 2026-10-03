@@ -76,12 +76,24 @@ def _valid_result(**overrides: object) -> dict[str, object]:
         "total_cost_eur": 30_000,
         "confidence_pct": 70,
         "phases": [
-            {"name": "Discovery", "duration_weeks": 1, "cost_eur": 5_000,
-             "summary": "Workshops, scoping and tech spike."},
-            {"name": "Implementation", "duration_weeks": 6, "cost_eur": 20_000,
-             "summary": "Build and integrate the core SaaS features."},
-            {"name": "QA + launch", "duration_weeks": 1, "cost_eur": 5_000,
-             "summary": "Test pass and production rollout."},
+            {
+                "name": "Discovery",
+                "duration_weeks": 1,
+                "cost_eur": 5_000,
+                "summary": "Workshops, scoping and tech spike.",
+            },
+            {
+                "name": "Implementation",
+                "duration_weeks": 6,
+                "cost_eur": 20_000,
+                "summary": "Build and integrate the core SaaS features.",
+            },
+            {
+                "name": "QA + launch",
+                "duration_weeks": 1,
+                "cost_eur": 5_000,
+                "summary": "Test pass and production rollout.",
+            },
         ],
     }
     base.update(overrides)
@@ -118,9 +130,7 @@ def test_high_confidence_accepts_any_summary_prefix() -> None:
 
 def test_phase_bounds_are_enforced() -> None:
     bad_phase = _valid_result(
-        phases=[
-            {"name": "x", "duration_weeks": 0, "cost_eur": 0, "summary": "too short"}
-        ],
+        phases=[{"name": "x", "duration_weeks": 0, "cost_eur": 0, "summary": "too short"}],
         total_cost_eur=0,
         total_duration_weeks=1,
     )

@@ -23,12 +23,24 @@ def _canned_result() -> EstimationResult:
         total_cost_eur=30_000,
         confidence_pct=70,
         phases=[
-            {"name": "Discovery", "duration_weeks": 1, "cost_eur": 5_000,
-             "summary": "Workshops, scoping and tech spike."},
-            {"name": "Implementation", "duration_weeks": 6, "cost_eur": 20_000,
-             "summary": "Build the core SaaS features."},
-            {"name": "QA + launch", "duration_weeks": 1, "cost_eur": 5_000,
-             "summary": "Test pass and production rollout."},
+            {
+                "name": "Discovery",
+                "duration_weeks": 1,
+                "cost_eur": 5_000,
+                "summary": "Workshops, scoping and tech spike.",
+            },
+            {
+                "name": "Implementation",
+                "duration_weeks": 6,
+                "cost_eur": 20_000,
+                "summary": "Build the core SaaS features.",
+            },
+            {
+                "name": "QA + launch",
+                "duration_weeks": 1,
+                "cost_eur": 5_000,
+                "summary": "Test pass and production rollout.",
+            },
         ],
     )
 
@@ -41,9 +53,7 @@ class FakeEstimationService:
 
     def estimate(self, request: EstimationRequest) -> EstimationResponse:
         self.calls.append(request)
-        return EstimationResponse(
-            result=_canned_result(), prompt_version="v1", cached=False
-        )
+        return EstimationResponse(result=_canned_result(), prompt_version="v1", cached=False)
 
 
 @pytest.fixture

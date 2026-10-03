@@ -8,7 +8,6 @@ from __future__ import annotations
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
 
 from app.schemas.estimation import EstimationRequest, EstimationResult
 
@@ -27,10 +26,18 @@ def _canned_result() -> EstimationResult:
         summary="Standard mobile app for appointment management.",
         confidence_pct=70,
         phases=[
-            {"name": "Discovery", "duration_weeks": 1, "cost_eur": 5_000,
-             "summary": "Scoping and tech spike."},
-            {"name": "Build", "duration_weeks": 6, "cost_eur": 20_000,
-             "summary": "Core feature implementation."},
+            {
+                "name": "Discovery",
+                "duration_weeks": 1,
+                "cost_eur": 5_000,
+                "summary": "Scoping and tech spike.",
+            },
+            {
+                "name": "Build",
+                "duration_weeks": 6,
+                "cost_eur": 20_000,
+                "summary": "Core feature implementation.",
+            },
         ],
         total_duration_weeks=7,
         total_cost_eur=25_000,
@@ -84,9 +91,7 @@ def test_bucket_changes_when_any_option_changes() -> None:
     from app.cache.semantic import EstimationSemanticCache
 
     base = _valid_request()
-    other = EstimationRequest.model_validate(
-        {**base.model_dump(), "output_format": "phases_table"}
-    )
+    other = EstimationRequest.model_validate({**base.model_dump(), "output_format": "phases_table"})
     assert EstimationSemanticCache.bucket_for(
         base, prompt_version="v1"
     ) != EstimationSemanticCache.bucket_for(other, prompt_version="v1")
