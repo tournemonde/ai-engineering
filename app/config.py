@@ -1,49 +1,43 @@
-"""Application settings loaded from environment variables."""
-
-from __future__ import annotations
-
 from functools import lru_cache
 from typing import Literal
 
-from pydantic import Field, model_validator
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """Runtime configuration for the CAG estimation service."""
+    """Application settings loaded from environment variables and .env file."""
 
-    # snippet: settings fields
-    LLM_PROVIDER: Literal["openai", "anthropic"] = "openai"
-    LLM_MODEL: str = ""
+    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+
+    # --- Session 2 fields (kept for backwards compatibility with the live demos) ---
     OPENAI_API_KEY: str | None = None
     ANTHROPIC_API_KEY: str | None = None
-    APP_ENV: str = "development"
-    LOG_LEVEL: str = "DEBUG"
-    MAX_OUTPUT_TOKENS: int = Field(default=4000, ge=256, le=16000)
+    LLM_PROVIDER: Literal["openai", "anthropic"] = "anthropic"
+    LLM_MODEL: str = "claude-haiku-4-5"
+    APP_ENV: Literal["development", "staging", "production"] = "development"
+    LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "DEBUG"
 
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-    )
+    # --- Session 3 fields (LiteLLM wrapper, Redis cache, Streamlit transport) ---
+    PRIMARY_MODEL: str = "gpt-4o-mini"
+    FALLBACK_MODEL: str = "claude-haiku-4-5-20251001"
+    LLM_TIMEOUT: int = 30
+    LLM_RETRIES: int = 2
 
-    # snippet: provider key validation
+    REDIS_URL: str = "redis://localhost:6379"
+    CACHE_TTL: int = 86400
+
+    ESTIMATOR_API_BASE_URL: str = "http://localhost:8000"
+
     @model_validator(mode="after")
-    def validate_provider_credentials(self) -> Settings:
-        if not self.LLM_MODEL:
-            if self.LLM_PROVIDER == "openai":
-                self.LLM_MODEL = "gpt-4o-mini"
-            else:
-                self.LLM_MODEL = "claude-haiku-4-5"
-
-        if self.LLM_PROVIDER == "openai" and not self.OPENAI_API_KEY:
-            raise ValueError("OPENAI_API_KEY is required when LLM_PROVIDER=openai")
-        if self.LLM_PROVIDER == "anthropic" and not self.ANTHROPIC_API_KEY:
-            raise ValueError("ANTHROPIC_API_KEY is required when LLM_PROVIDER=anthropic")
+    def validate_at_least_one_api_key(self) -> "Settings":
+        """LiteLLM may try either provider via fallback, so we require at least one key."""
+        if not self.OPENAI_API_KEY and not self.ANTHROPIC_API_KEY:
+            raise ValueError("At least one of OPENAI_API_KEY or ANTHROPIC_API_KEY must be set")
         return self
 
 
 @lru_cache
 def get_settings() -> Settings:
-    """Return cached settings singleton."""
+    """Return cached application settings (singleton)."""
     return Settings()
