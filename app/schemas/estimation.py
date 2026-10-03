@@ -12,9 +12,13 @@ When the LLM violates a validator, Instructor re-prompts the model with the
 ``ValueError`` message until it agrees (up to ``max_retries`` attempts).
 """
 
+from __future__ import annotations
+
 from enum import Enum
 
 from pydantic import BaseModel, Field, model_validator
+
+from app.sessions.models import ProjectMetadata
 
 
 class ProjectType(str, Enum):
@@ -114,3 +118,11 @@ class EstimationResponse(BaseModel):
     result: EstimationResult
     prompt_version: str
     cached: bool = False
+
+
+class SessionEstimationResponse(EstimationResponse):
+    """Conversational response: same estimation payload plus the updated
+    ``project_metadata`` so the client can render the memory panel without a
+    second round-trip."""
+
+    project_metadata: ProjectMetadata

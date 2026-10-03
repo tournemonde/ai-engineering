@@ -134,4 +134,47 @@ Lo que vive **fuera** del template (en código): el contrato (`EstimationRequest
 
 ---
 
-> Este proyecto forma parte del **Master en AI Engineering** y es la base sobre la que se construye en directo el resto de la Sesión 04 (output estructurado, guardrails, cache semántico).
+## Sesión 5 — Memoria conversacional y adjuntos
+
+El estimator deja de ser solo transaccional y soporta **sesiones conversacionales**: el cliente puede refinar el alcance a lo largo de varios turnos, subir PDF/Word y el sistema recuerda el proyecto en curso. `POST /api/v1/estimate` se mantiene intacto.
+
+### Endpoints nuevos
+
+```
+POST /sessions                              → 201 {"session_id": "<uuid>"}
+GET  /sessions/{session_id}                 → 200 {session_id, message_count, max_turns, metadata}
+POST /sessions/{session_id}/estimate        → 200 SessionEstimationResponse
+   (multipart/form-data: transcript, project_type, detail_level, output_format, attachments[])
+```
+
+`SessionEstimationResponse` hereda de `EstimationResponse` y añade `project_metadata` para que Streamlit pinte el panel de memoria sin un segundo round-trip.
+
+### Decisiones de diseño
+
+1. **Camino B para adjuntos.** Extraemos texto con `pypdf` y `python-docx`, lo recortamos a `MAX_ATTACHMENT_CHARS` y lo concatenamos al transcript con fences (`--- attachment: spec.pdf ---`). Mantiene el wrapper agnóstico de proveedor y prepara el chunking de RAG del módulo 3.
+2. **`project_metadata` con extractor LLM.** Tras cada estimación, una segunda llamada (modelo barato `METADATA_EXTRACTOR_MODEL`) devuelve un `ProjectMetadata` parcial vía Instructor. Fusión: escalares sobrescriben si no son null; tecnologías se unen case-insensitive. Si falla, se conserva la metadata previa.
+3. **Memoria en proceso.** `SessionStore` es un `dict` con `Lock`. Volatilidad intencional (se pierde al reiniciar).
+4. **Cachés desactivadas en el path conversacional.** Historial + metadata hacen que dos transcripts idénticos no sean la misma llamada. `cached` siempre es `false` aquí. Los guardrails de entrada corren sobre el transcript enriquecido (adjuntos incluidos).
+5. **Ventana deslizante `MAX_CONVERSATION_TURNS=6`.** El system prompt (v2) se regenera cada turno desde `project_metadata` y no consume slot.
+
+### Cómo probar
+
+```bash
+uv sync
+uv run uvicorn app.main:app --reload
+# otra terminal
+uv run streamlit run streamlit_app.py
+uv run pytest tests/test_sessions_async_step7.py -v
+```
+
+### Variables nuevas
+
+| Variable | Default | Notas |
+|---|---|---|
+| `MAX_CONVERSATION_TURNS` | `6` | Pares user+assistant de la ventana |
+| `MAX_ATTACHMENT_CHARS` | `60000` | Corte por archivo extraído |
+| `METADATA_EXTRACTOR_MODEL` | `gpt-4o-mini` | Segunda llamada por turno |
+
+---
+
+> Este proyecto forma parte del **Master en AI Engineering**. El directo de la Sesión 05 construye encima: compresión de memoria con anclas, tier dinámico y Actor-Critic-Boss.
