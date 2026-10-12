@@ -16,15 +16,30 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Protocol
 
+import fakeredis
 import httpx
 from fastapi.testclient import TestClient
 
+from app.config import get_settings
+from app.dependencies import (
+    get_estimation_service,
+    get_llm_wrapper,
+    get_openai_client,
+    get_semantic_cache,
+    get_session_store,
+)
 from app.main import app
+from app.services.cache import EstimationCache
+from app.services.estimation import EstimationService
+from app.services.llm_wrapper import LLMWrapper
+from app.sessions.store import SessionStore
 from evals.stress.fixtures.build_pdfs import MARKERS, build_all
 from evals.stress.metrics import CostBudgetMetric, LatencyBudgetMetric, MemoryDriftMetric
 from evals.stress.scenarios import SCENARIOS, ScenarioProfile, get_scenario
@@ -76,8 +91,54 @@ class StressClient(Protocol):
     def close(self) -> None: ...
 
 
+def _wire_inprocess_live(*, primary_model: str | None = None) -> None:
+    """Wire real LLM keys with fakeredis so stress runs without Docker Redis.
+
+    Conversational estimates skip caches, but ``LLMWrapper`` still requires an
+    ``EstimationCache`` instance. Fakeredis keeps that dependency local.
+    """
+    if primary_model:
+        os.environ["PRIMARY_MODEL"] = primary_model
+    # Force localhost Redis URL out of the way even if Settings reads it later.
+    os.environ.setdefault("REDIS_URL", "redis://127.0.0.1:6379")
+    get_settings.cache_clear()
+    settings = get_settings()
+
+    cache = EstimationCache(
+        fakeredis.FakeRedis(decode_responses=True),
+        ttl=settings.CACHE_TTL,
+    )
+    wrapper = LLMWrapper(
+        openai_api_key=settings.OPENAI_API_KEY,
+        anthropic_api_key=settings.ANTHROPIC_API_KEY,
+        primary_model=settings.PRIMARY_MODEL,
+        fallback_model=settings.FALLBACK_MODEL,
+        timeout=settings.LLM_TIMEOUT,
+        num_retries=settings.LLM_RETRIES,
+        cache=cache,
+    )
+    store = SessionStore(max_turns=settings.MAX_CONVERSATION_TURNS)
+    service = EstimationService(
+        llm_wrapper=wrapper,
+        exact_cache=cache,
+        semantic_cache=None,
+        openai_client=get_openai_client(),
+        metadata_extractor_model=settings.METADATA_EXTRACTOR_MODEL,
+        compression_model=settings.COMPRESSION_MODEL,
+        anchor_detection_mode=settings.ANCHOR_DETECTION_MODE,
+        conversational_prompt_version=settings.CONVERSATIONAL_PROMPT_VERSION,
+        critic_model=settings.CRITIC_MODEL,
+        boss_max_iterations=settings.BOSS_MAX_ITERATIONS,
+    )
+    app.dependency_overrides[get_estimation_service] = lambda: service
+    app.dependency_overrides[get_session_store] = lambda: store
+    app.dependency_overrides[get_llm_wrapper] = lambda: wrapper
+    app.dependency_overrides[get_semantic_cache] = lambda: None
+
+
 class InProcessClient:
-    def __init__(self) -> None:
+    def __init__(self, *, primary_model: str | None = None) -> None:
+        _wire_inprocess_live(primary_model=primary_model)
         self._client = TestClient(app)
 
     def create_session(self) -> str:
@@ -123,6 +184,7 @@ class InProcessClient:
 
     def close(self) -> None:
         self._client.close()
+        app.dependency_overrides.clear()
 
 
 class HttpClient:
@@ -236,47 +298,21 @@ def _run_scenario_repeat(
     for turn in turns:
         declared_facts.append((turn.turn_index, turn.fact_to_remember))
         error = ""
-        try:
-            client.estimate(
-                session_id,
-                transcript=turn.transcript,
-                attachment_path=attachment_path if turn.turn_index == 1 else None,
-            )
-            snapshot = client.get_session(session_id)
-            last_turn = snapshot.get("last_turn") or {}
-            # Prefer earliest durable fact (project name / first budget) for drift.
-            fact = declared_facts[0][1] if declared_facts else turn.fact_to_remember
-            metrics = _evaluate_row(
-                last_turn=last_turn,
-                snapshot=snapshot,
-                fact=fact,
-                latency_budget_ms=latency_budget_ms,
-                cost_budget_usd=cost_budget_usd,
-            )
-            rows.append(
-                {
-                    "scenario": scenario.name,
-                    "repeat": repeat,
-                    "attachment_size_kb": attachment_size_kb,
-                    "turn_index": last_turn.get("turn_index", turn.turn_index),
-                    "session_id": session_id,
-                    "enriched_transcript_chars": last_turn.get("enriched_transcript_chars", ""),
-                    "attachments_total_chars": last_turn.get("attachments_total_chars", ""),
-                    "messages_in_window": last_turn.get("messages_in_window", ""),
-                    "anchors_count": last_turn.get("anchors_count", ""),
-                    "summary_chars": last_turn.get("summary_chars", ""),
-                    "tokens_in": last_turn.get("tokens_in", ""),
-                    "tokens_out": last_turn.get("tokens_out", ""),
-                    "cost_usd": last_turn.get("cost_usd", ""),
-                    "latency_ms": last_turn.get("latency_ms", ""),
-                    "cache_hit_kind": last_turn.get("cache_hit_kind", ""),
-                    "last_resolved_tier": last_turn.get("last_resolved_tier", ""),
-                    **metrics,
-                    "error": error,
-                }
-            )
-        except Exception as exc:  # noqa: BLE001
-            error = f"{type(exc).__name__}: {exc}"[:400]
+        last_exc: Exception | None = None
+        for attempt in range(1, 4):
+            try:
+                client.estimate(
+                    session_id,
+                    transcript=turn.transcript,
+                    attachment_path=attachment_path if turn.turn_index == 1 else None,
+                )
+                last_exc = None
+                break
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                time.sleep(min(2 * attempt, 6))
+        if last_exc is not None:
+            error = f"{type(last_exc).__name__}: {last_exc}"[:400]
             rows.append(
                 {
                     "scenario": scenario.name,
@@ -304,6 +340,40 @@ def _run_scenario_repeat(
             )
             # Stop this conversation on hard failure; continue other repeats.
             break
+
+        snapshot = client.get_session(session_id)
+        last_turn = snapshot.get("last_turn") or {}
+        # Prefer earliest durable fact (project name / first budget) for drift.
+        fact = declared_facts[0][1] if declared_facts else turn.fact_to_remember
+        metrics = _evaluate_row(
+            last_turn=last_turn,
+            snapshot=snapshot,
+            fact=fact,
+            latency_budget_ms=latency_budget_ms,
+            cost_budget_usd=cost_budget_usd,
+        )
+        rows.append(
+            {
+                "scenario": scenario.name,
+                "repeat": repeat,
+                "attachment_size_kb": attachment_size_kb,
+                "turn_index": last_turn.get("turn_index", turn.turn_index),
+                "session_id": session_id,
+                "enriched_transcript_chars": last_turn.get("enriched_transcript_chars", ""),
+                "attachments_total_chars": last_turn.get("attachments_total_chars", ""),
+                "messages_in_window": last_turn.get("messages_in_window", ""),
+                "anchors_count": last_turn.get("anchors_count", ""),
+                "summary_chars": last_turn.get("summary_chars", ""),
+                "tokens_in": last_turn.get("tokens_in", ""),
+                "tokens_out": last_turn.get("tokens_out", ""),
+                "cost_usd": last_turn.get("cost_usd", ""),
+                "latency_ms": last_turn.get("latency_ms", ""),
+                "cache_hit_kind": last_turn.get("cache_hit_kind", ""),
+                "last_resolved_tier": last_turn.get("last_resolved_tier", ""),
+                **metrics,
+                "error": error,
+            }
+        )
     return rows
 
 
@@ -400,23 +470,27 @@ def run_stress(
     max_turns: int | None,
     include_multi_turn: bool,
     include_attachments: bool,
+    workers: int = 3,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
+    jobs: list[tuple[str, Any]] = []
 
     if include_multi_turn:
         for scenario in scenarios:
             for repeat in range(1, repeats + 1):
-                print(f"[multi-turn] scenario={scenario.name} repeat={repeat}")
-                rows.extend(
-                    _run_scenario_repeat(
-                        client,
-                        scenario=scenario,
-                        repeat=repeat,
-                        attachment_size_kb=0,
-                        attachment_path=None,
-                        latency_budget_ms=latency_budget_ms,
-                        cost_budget_usd=cost_budget_usd,
-                        max_turns=max_turns,
+                jobs.append(
+                    (
+                        f"multi-turn:{scenario.name}:r{repeat}",
+                        lambda sc=scenario, rp=repeat: _run_scenario_repeat(
+                            client,
+                            scenario=sc,
+                            repeat=rp,
+                            attachment_size_kb=0,
+                            attachment_path=None,
+                            latency_budget_ms=latency_budget_ms,
+                            cost_budget_usd=cost_budget_usd,
+                            max_turns=max_turns,
+                        ),
                     )
                 )
 
@@ -427,17 +501,36 @@ def run_stress(
         for size_kb in attachment_sizes:
             path = _pdf_path_for_size(size_kb, generated_dir)
             for repeat in range(1, repeats + 1):
-                print(f"[attachment] size_kb={size_kb} repeat={repeat}")
-                rows.extend(
-                    _run_attachment_probe(
-                        client,
-                        size_kb=size_kb,
-                        repeat=repeat,
-                        attachment_path=path,
-                        latency_budget_ms=latency_budget_ms,
-                        cost_budget_usd=cost_budget_usd,
+                jobs.append(
+                    (
+                        f"attachment:{size_kb}kb:r{repeat}",
+                        lambda sk=size_kb, rp=repeat, p=path: _run_attachment_probe(
+                            client,
+                            size_kb=sk,
+                            repeat=rp,
+                            attachment_path=p,
+                            latency_budget_ms=latency_budget_ms,
+                            cost_budget_usd=cost_budget_usd,
+                        ),
                     )
                 )
+
+    # Independent sessions can run in parallel; turns within a session stay serial.
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = {pool.submit(fn): label for label, fn in jobs}
+        for fut in as_completed(futures):
+            label = futures[fut]
+            print(f"[done] {label}")
+            rows.extend(fut.result())
+
+    rows.sort(
+        key=lambda r: (
+            str(r.get("scenario", "")),
+            int(r.get("attachment_size_kb") or 0),
+            int(r.get("repeat") or 0),
+            int(r.get("turn_index") or 0),
+        )
+    )
     return rows
 
 
@@ -492,6 +585,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=Path,
         default=Path("evals/stress/fixtures/generated"),
     )
+    parser.add_argument(
+        "--primary-model",
+        default="gpt-4o-mini",
+        help="Override PRIMARY_MODEL for in-process runs (keeps curves comparable).",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel sessions (default 1: SessionStore is not thread-safe).",
+    )
     return parser.parse_args(argv)
 
 
@@ -510,7 +614,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.http:
         client = HttpClient(args.http)
     else:
-        client = InProcessClient()
+        client = InProcessClient(primary_model=args.primary_model)
 
     t0 = time.perf_counter()
     try:
@@ -525,6 +629,7 @@ def main(argv: list[str] | None = None) -> int:
             max_turns=args.max_turns,
             include_multi_turn=not args.skip_multi_turn,
             include_attachments=not args.skip_attachments,
+            workers=args.workers,
         )
     finally:
         client.close()
