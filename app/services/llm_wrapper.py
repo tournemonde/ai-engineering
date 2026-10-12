@@ -111,6 +111,53 @@ class LLMWrapper:
         # underlying providers with the same ``response_model=`` API.
         self._instructor = instructor.from_litellm(litellm.completion)
 
+        # snippet: turn usage accumulator (Session 6 stress observability)
+        self.reset_turn_usage()
+
+    # ------------------------------------------------------------------
+    # Turn usage accumulator (sums every LLM call within one estimate turn)
+    # ------------------------------------------------------------------
+
+    def reset_turn_usage(self) -> None:
+        """Clear the per-turn counters. Call at the start of an estimate turn."""
+        self._turn_tokens_in = 0
+        self._turn_tokens_out = 0
+        self._turn_cost_usd = 0.0
+        self._turn_latency_ms = 0
+
+    def consume_turn_usage(self) -> dict[str, Any]:
+        """Return accumulated usage for the current turn and reset counters."""
+        snapshot = {
+            "tokens_in": self._turn_tokens_in,
+            "tokens_out": self._turn_tokens_out,
+            "cost_usd": round(self._turn_cost_usd, 6),
+            "latency_ms": self._turn_latency_ms,
+        }
+        self.reset_turn_usage()
+        return snapshot
+
+    def _record_turn_usage(
+        self,
+        *,
+        tokens_in: int,
+        tokens_out: int,
+        cost_usd: float,
+        latency_ms: int,
+    ) -> None:
+        self._turn_tokens_in += tokens_in
+        self._turn_tokens_out += tokens_out
+        self._turn_cost_usd += cost_usd
+        self._turn_latency_ms += latency_ms
+
+    @staticmethod
+    def _usage_from_completion(completion: Any) -> tuple[int, int]:
+        usage = getattr(completion, "usage", None)
+        if usage is None:
+            return 0, 0
+        tokens_in = int(getattr(usage, "prompt_tokens", 0) or 0)
+        tokens_out = int(getattr(usage, "completion_tokens", 0) or 0)
+        return tokens_in, tokens_out
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -168,6 +215,12 @@ class LLMWrapper:
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
         result = self._normalise_response(response, latency_ms=latency_ms)
+        self._record_turn_usage(
+            tokens_in=result["usage"]["input_tokens"],
+            tokens_out=result["usage"]["output_tokens"],
+            cost_usd=result["cost_usd"],
+            latency_ms=latency_ms,
+        )
         log.info(
             "llm_call_completed",
             model=result["model"],
@@ -197,7 +250,7 @@ class LLMWrapper:
         rationale as ``complete_structured``: the LiteLLM Router would
         round-robin between deployments and could non-deterministically pick
         the fallback. Instructor handles re-prompts when Pydantic validators
-        raise.
+        raise. ``meta`` includes tokens and cost when Instructor returns usage.
         """
         target_model = model_override or self.primary_model
         api_key = (
@@ -214,7 +267,7 @@ class LLMWrapper:
         )
         t0 = time.perf_counter()
         try:
-            result = self._instructor.chat.completions.create(
+            result, completion = self._instructor.chat.completions.create_with_completion(
                 model=target_model,
                 api_key=api_key,
                 timeout=self.timeout,
@@ -234,16 +287,30 @@ class LLMWrapper:
             raise
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
+        tokens_in, tokens_out = self._usage_from_completion(completion)
+        cost_usd = _estimate_cost(target_model, tokens_in, tokens_out)
+        self._record_turn_usage(
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+            latency_ms=latency_ms,
+        )
         meta = {
             "model": _normalise_model_name(target_model),
             "provider": _provider_from_model(target_model),
             "latency_ms": latency_ms,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost_usd": cost_usd,
         }
         log.info(
             "llm_structured_chat_completed",
             model=meta["model"],
             provider=meta["provider"],
             latency_ms=latency_ms,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
         )
         return result, meta
 
@@ -259,12 +326,10 @@ class LLMWrapper:
     ) -> tuple[T, dict[str, Any]]:
         """Run the LLM with Instructor and return ``(model_instance, meta)``.
 
-        ``meta`` includes ``model``, ``provider`` and ``latency_ms``. Instructor
-        re-prompts the LLM up to ``max_retries`` times when a Pydantic validator
-        raises, feeding the ``ValueError`` message back to the model.
-
-        Streaming bypasses are not relevant here — the entire model is built
-        atomically by Instructor before this function returns.
+        ``meta`` includes ``model``, ``provider``, ``latency_ms``, ``tokens_in``,
+        ``tokens_out`` and ``cost_usd``. Instructor re-prompts the LLM up to
+        ``max_retries`` times when a Pydantic validator raises, feeding the
+        ``ValueError`` message back to the model.
         """
         target_model = model_override or self.primary_model
         messages = [
@@ -285,7 +350,7 @@ class LLMWrapper:
         )
         t0 = time.perf_counter()
         try:
-            result = self._instructor.chat.completions.create(
+            result, completion = self._instructor.chat.completions.create_with_completion(
                 model=target_model,
                 api_key=api_key,
                 timeout=self.timeout,
@@ -305,16 +370,30 @@ class LLMWrapper:
             raise
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
+        tokens_in, tokens_out = self._usage_from_completion(completion)
+        cost_usd = _estimate_cost(target_model, tokens_in, tokens_out)
+        self._record_turn_usage(
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+            latency_ms=latency_ms,
+        )
         meta = {
             "model": _normalise_model_name(target_model),
             "provider": _provider_from_model(target_model),
             "latency_ms": latency_ms,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost_usd": cost_usd,
         }
         log.info(
             "llm_structured_call_completed",
             model=meta["model"],
             provider=meta["provider"],
             latency_ms=latency_ms,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
         )
         return result, meta
 

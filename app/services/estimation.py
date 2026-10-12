@@ -171,6 +171,7 @@ class EstimationService:
         detail_level: DetailLevel,
         output_format: OutputFormat,
         tier: Tier | None = None,
+        attachments_total_chars: int = 0,
     ) -> EstimationResponse:
         """Multi-turn estimation pipeline (Session 5).
 
@@ -184,6 +185,10 @@ class EstimationService:
         - After validation, the session's history is appended and a second
           LLM call refreshes ``ProjectMetadata``.
         """
+        # snippet: reset per-turn usage before any LLM call in this turn
+        if hasattr(self.llm_wrapper, "reset_turn_usage"):
+            self.llm_wrapper.reset_turn_usage()
+
         # 1. Input guardrail on the enriched transcript (the caller has
         #    already concatenated any extracted attachment text into it).
         check_input(transcript, openai_client=self.openai_client)
@@ -261,6 +266,31 @@ class EstimationService:
             llm_wrapper=self.llm_wrapper,
             model=self.metadata_extractor_model,
         )
+
+        # snippet: Session 6 aggregated turn_observed event
+        session.turn_count += 1
+        usage = (
+            self.llm_wrapper.consume_turn_usage()
+            if hasattr(self.llm_wrapper, "consume_turn_usage")
+            else {"tokens_in": 0, "tokens_out": 0, "cost_usd": 0.0, "latency_ms": 0}
+        )
+        turn_observed: dict[str, Any] = {
+            "turn_index": session.turn_count,
+            "session_id": session.session_id,
+            "enriched_transcript_chars": len(transcript),
+            "attachments_total_chars": attachments_total_chars,
+            "messages_in_window": len(session.history.messages),
+            "anchors_count": len(session.history.anchors),
+            "summary_chars": len(session.history.summary or ""),
+            "tokens_in": usage["tokens_in"],
+            "tokens_out": usage["tokens_out"],
+            "cost_usd": usage["cost_usd"],
+            "latency_ms": usage["latency_ms"],
+            "cache_hit_kind": "none",
+            "last_resolved_tier": session.last_resolved_tier,
+        }
+        session.last_turn = turn_observed
+        log.info("turn_observed", **turn_observed)
 
         return EstimationResponse(
             result=result,

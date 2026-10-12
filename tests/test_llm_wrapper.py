@@ -147,8 +147,11 @@ def test_complete_structured_chat_forwards_messages(wrapper: LLMWrapper) -> None
     ]
 
     expected = _Answer(text="ok")
+    completion = _fake_completion(model="gpt-4o-mini", input_tokens=40, output_tokens=20)
     with patch.object(
-        wrapper._instructor.chat.completions, "create", return_value=expected
+        wrapper._instructor.chat.completions,
+        "create_with_completion",
+        return_value=(expected, completion),
     ) as mocked:
         result, meta = wrapper.complete_structured_chat(
             messages=messages,
@@ -163,6 +166,12 @@ def test_complete_structured_chat_forwards_messages(wrapper: LLMWrapper) -> None
     assert meta["model"] == "gpt-4o-mini"
     assert meta["provider"] == "openai"
     assert "latency_ms" in meta
+    assert meta["tokens_in"] == 40
+    assert meta["tokens_out"] == 20
+    assert meta["cost_usd"] > 0
+    usage = wrapper.consume_turn_usage()
+    assert usage["tokens_in"] == 40
+    assert usage["tokens_out"] == 20
 
 
 def test_complete_structured_chat_uses_anthropic_key_for_claude(wrapper: LLMWrapper) -> None:
@@ -171,8 +180,11 @@ def test_complete_structured_chat_uses_anthropic_key_for_claude(wrapper: LLMWrap
     class _Answer(BaseModel):
         text: str
 
+    completion = _fake_completion(model="claude-haiku-4-5-20251001")
     with patch.object(
-        wrapper._instructor.chat.completions, "create", return_value=_Answer(text="x")
+        wrapper._instructor.chat.completions,
+        "create_with_completion",
+        return_value=(_Answer(text="x"), completion),
     ) as mocked:
         wrapper.complete_structured_chat(
             messages=[{"role": "user", "content": "hi"}],

@@ -15,7 +15,7 @@ Design notes
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Literal
+from typing import Any, Literal
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -171,3 +171,6 @@ class Session(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_resolved_tier: str | None = None
     last_tier_rule: str | None = None
+    # snippet: Session 6 turn observability
+    turn_count: int = Field(default=0, ge=0)
+    last_turn: dict[str, Any] | None = Field(default=None)

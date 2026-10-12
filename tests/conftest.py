@@ -70,6 +70,37 @@ class FakeLLMWrapper:
         self.scripted: list[tuple[EstimationResult, ProjectMetadata]] = []
         self._turn = 0
         self._extra_factories: dict[type, callable] = {}
+        # snippet: Session 6 turn usage accumulator (mirrors LLMWrapper)
+        self.reset_turn_usage()
+
+    def reset_turn_usage(self) -> None:
+        self._turn_tokens_in = 0
+        self._turn_tokens_out = 0
+        self._turn_cost_usd = 0.0
+        self._turn_latency_ms = 0
+
+    def consume_turn_usage(self) -> dict:
+        snapshot = {
+            "tokens_in": self._turn_tokens_in,
+            "tokens_out": self._turn_tokens_out,
+            "cost_usd": round(self._turn_cost_usd, 6),
+            "latency_ms": self._turn_latency_ms,
+        }
+        self.reset_turn_usage()
+        return snapshot
+
+    def _record_turn_usage(
+        self,
+        *,
+        tokens_in: int = 10,
+        tokens_out: int = 5,
+        cost_usd: float = 0.00001,
+        latency_ms: int = 1,
+    ) -> None:
+        self._turn_tokens_in += tokens_in
+        self._turn_tokens_out += tokens_out
+        self._turn_cost_usd += cost_usd
+        self._turn_latency_ms += latency_ms
 
     def add_turn(
         self,
@@ -110,7 +141,15 @@ class FakeLLMWrapper:
                 "kwargs": kwargs,
             }
         )
-        meta = {"model": "gpt-4o-mini", "provider": "openai", "latency_ms": 1}
+        self._record_turn_usage()
+        meta = {
+            "model": "gpt-4o-mini",
+            "provider": "openai",
+            "latency_ms": 1,
+            "tokens_in": 10,
+            "tokens_out": 5,
+            "cost_usd": 0.00001,
+        }
 
         if response_model is EstimationResult:
             idx = self._turn // 2
