@@ -3,27 +3,26 @@ and structured logging to every LLM call in the estimator.
 
 Design notes
 ------------
-- The wrapper exposes two primitives: ``complete()`` (blocking, full response) and
-  ``complete_stream()`` (yields chunks). Higher-level orchestration (preprocessing,
-  validation, prompt building) stays in ``llm_service.py``.
+- The wrapper exposes two primitives:
+  - ``complete()``: legacy free-text answer (kept for tests that depend on it).
+  - ``complete_structured()``: returns a validated Pydantic model via Instructor,
+    re-prompting on validator errors up to ``max_retries`` times.
 - The Router is configured with two deployments under the same ``model_name``
   ("estimator") so LiteLLM can switch from primary to fallback transparently.
-  When the caller overrides the model per-request (Session 2 live demos), we
-  bypass the Router and call ``litellm.completion`` directly with explicit
-  credentials — that path has no fallback by design.
-- The cache key includes the full system prompt and the generation knobs, so any
-  Session 2 toggle (preprocessing, num_examples, ACTIVE_OUTPUT_PROMPT) implicitly
-  invalidates the cache without manual flushing.
+  When the caller overrides the model per-request we bypass the Router and call
+  ``litellm.completion`` directly — that path has no fallback by design.
 """
 
 from __future__ import annotations
 
 import time
-from typing import Any, Iterator
+from typing import Any, TypeVar
 
+import instructor
 import litellm
 import structlog
 from litellm import Router
+from pydantic import BaseModel
 
 from app.services.cache import EstimationCache
 
@@ -38,6 +37,9 @@ MODEL_COSTS: dict[str, dict[str, float]] = {
     "claude-haiku-4-5-20251001": {"input": 1.00, "output": 5.00},
     "claude-sonnet-4-5": {"input": 3.00, "output": 15.00},
 }
+
+
+T = TypeVar("T", bound=BaseModel)
 
 
 def _estimate_cost(model: str, tokens_in: int, tokens_out: int) -> float:
@@ -105,6 +107,57 @@ class LLMWrapper:
             num_retries=num_retries,
         )
 
+        # Instructor wraps ``litellm.completion`` so we can call any of the
+        # underlying providers with the same ``response_model=`` API.
+        self._instructor = instructor.from_litellm(litellm.completion)
+
+        # snippet: turn usage accumulator (Session 6 stress observability)
+        self.reset_turn_usage()
+
+    # ------------------------------------------------------------------
+    # Turn usage accumulator (sums every LLM call within one estimate turn)
+    # ------------------------------------------------------------------
+
+    def reset_turn_usage(self) -> None:
+        """Clear the per-turn counters. Call at the start of an estimate turn."""
+        self._turn_tokens_in = 0
+        self._turn_tokens_out = 0
+        self._turn_cost_usd = 0.0
+        self._turn_latency_ms = 0
+
+    def consume_turn_usage(self) -> dict[str, Any]:
+        """Return accumulated usage for the current turn and reset counters."""
+        snapshot = {
+            "tokens_in": self._turn_tokens_in,
+            "tokens_out": self._turn_tokens_out,
+            "cost_usd": round(self._turn_cost_usd, 6),
+            "latency_ms": self._turn_latency_ms,
+        }
+        self.reset_turn_usage()
+        return snapshot
+
+    def _record_turn_usage(
+        self,
+        *,
+        tokens_in: int,
+        tokens_out: int,
+        cost_usd: float,
+        latency_ms: int,
+    ) -> None:
+        self._turn_tokens_in += tokens_in
+        self._turn_tokens_out += tokens_out
+        self._turn_cost_usd += cost_usd
+        self._turn_latency_ms += latency_ms
+
+    @staticmethod
+    def _usage_from_completion(completion: Any) -> tuple[int, int]:
+        usage = getattr(completion, "usage", None)
+        if usage is None:
+            return 0, 0
+        tokens_in = int(getattr(usage, "prompt_tokens", 0) or 0)
+        tokens_out = int(getattr(usage, "completion_tokens", 0) or 0)
+        return tokens_in, tokens_out
+
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
@@ -118,9 +171,7 @@ class LLMWrapper:
         max_tokens: int = 4000,
         thinking_budget: int | None = None,
     ) -> dict[str, Any]:
-        """Single LLM call with cache + (optional) fallback. Returns the legacy dict shape
-        plus ``cache_hit`` and ``cost_usd`` fields.
-        """
+        """Single LLM call returning a free-text answer. Kept for tests."""
         cache_key_model = model_override or self.primary_model
         cache_key = EstimationCache.make_key(
             system_prompt=system_prompt,
@@ -148,7 +199,6 @@ class LLMWrapper:
             "llm_call_started",
             mode="blocking",
             model=model_override or self.primary_model,
-            has_thinking=thinking_budget is not None,
         )
         t0 = time.perf_counter()
         try:
@@ -165,6 +215,12 @@ class LLMWrapper:
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
         result = self._normalise_response(response, latency_ms=latency_ms)
+        self._record_turn_usage(
+            tokens_in=result["usage"]["input_tokens"],
+            tokens_out=result["usage"]["output_tokens"],
+            cost_usd=result["cost_usd"],
+            latency_ms=latency_ms,
+        )
         log.info(
             "llm_call_completed",
             model=result["model"],
@@ -178,64 +234,52 @@ class LLMWrapper:
         self.cache.set(cache_key, result)
         return {**result, "cache_hit": False}
 
-    def complete_stream(
+    def complete_structured_chat(
         self,
         *,
-        system_prompt: str,
-        user_message: str,
+        messages: list[dict[str, str]],
+        response_model: type[T],
         model_override: str | None = None,
         max_tokens: int = 4000,
-    ) -> Iterator[str]:
-        """Yield text chunks as they arrive from the model.
+        max_retries: int = 6,
+    ) -> tuple[T, dict[str, Any]]:
+        """Conversational variant of :meth:`complete_structured`.
 
-        Cache hits replay the cached estimation as a single chunk so the client UX
-        stays consistent. Cache misses stream live and the full text is cached
-        once the stream finishes (without ``cost_usd`` since LiteLLM does not
-        always report token usage for streaming calls).
+        Accepts a pre-built ``messages`` list (system + N user/assistant pairs +
+        current user). Bypasses the Router for deterministic routing — same
+        rationale as ``complete_structured``: the LiteLLM Router would
+        round-robin between deployments and could non-deterministically pick
+        the fallback. Instructor handles re-prompts when Pydantic validators
+        raise. ``meta`` includes tokens and cost when Instructor returns usage.
         """
-        cache_key_model = model_override or self.primary_model
-        cache_key = EstimationCache.make_key(
-            system_prompt=system_prompt,
-            user_message=user_message,
-            model=cache_key_model,
-            max_tokens=max_tokens,
-            thinking_budget=None,
-        )
-        cached = self.cache.get(cache_key)
-        if cached:
-            log.info("stream_cache_hit", chars=len(cached.get("estimation", "")))
-            yield cached.get("estimation", "")
-            return
-
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_message},
-        ]
-        kwargs = self._build_call_kwargs(
-            messages=messages,
-            max_tokens=max_tokens,
-            thinking_budget=None,
-            model_override=model_override,
-            stream=True,
+        target_model = model_override or self.primary_model
+        api_key = (
+            self.anthropic_api_key
+            if _provider_from_model(target_model) == "anthropic"
+            else self.openai_api_key
         )
 
         log.info(
-            "llm_stream_started",
-            model=model_override or self.primary_model,
+            "llm_structured_chat_started",
+            model=target_model,
+            response_model=response_model.__name__,
+            messages=len(messages),
         )
         t0 = time.perf_counter()
-        full_text: list[str] = []
         try:
-            response = self._dispatch(model_override=model_override, **kwargs)
-            for chunk in response:
-                delta = _extract_delta(chunk)
-                if delta:
-                    full_text.append(delta)
-                    yield delta
+            result, completion = self._instructor.chat.completions.create_with_completion(
+                model=target_model,
+                api_key=api_key,
+                timeout=self.timeout,
+                messages=messages,
+                response_model=response_model,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+            )
         except Exception as exc:
             latency_ms = int((time.perf_counter() - t0) * 1000)
             log.error(
-                "llm_stream_failed",
+                "llm_structured_chat_failed",
                 error_type=type(exc).__name__,
                 error=str(exc),
                 latency_ms=latency_ms,
@@ -243,21 +287,115 @@ class LLMWrapper:
             raise
 
         latency_ms = int((time.perf_counter() - t0) * 1000)
-        rendered = "".join(full_text)
-        log.info("llm_stream_completed", latency_ms=latency_ms, chars=len(rendered))
-
-        self.cache.set(
-            cache_key,
-            {
-                "estimation": rendered,
-                "model": model_override or self.primary_model,
-                "provider": _provider_from_model(model_override or self.primary_model),
-                "finish_reason": "stop",
-                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
-                "latency_ms": latency_ms,
-                "cost_usd": 0.0,
-            },
+        tokens_in, tokens_out = self._usage_from_completion(completion)
+        cost_usd = _estimate_cost(target_model, tokens_in, tokens_out)
+        self._record_turn_usage(
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+            latency_ms=latency_ms,
         )
+        meta = {
+            "model": _normalise_model_name(target_model),
+            "provider": _provider_from_model(target_model),
+            "latency_ms": latency_ms,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost_usd": cost_usd,
+        }
+        log.info(
+            "llm_structured_chat_completed",
+            model=meta["model"],
+            provider=meta["provider"],
+            latency_ms=latency_ms,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+        )
+        return result, meta
+
+    def complete_structured(
+        self,
+        *,
+        system_prompt: str,
+        user_message: str,
+        response_model: type[T],
+        model_override: str | None = None,
+        max_tokens: int = 4000,
+        max_retries: int = 6,
+    ) -> tuple[T, dict[str, Any]]:
+        """Run the LLM with Instructor and return ``(model_instance, meta)``.
+
+        ``meta`` includes ``model``, ``provider``, ``latency_ms``, ``tokens_in``,
+        ``tokens_out`` and ``cost_usd``. Instructor re-prompts the LLM up to
+        ``max_retries`` times when a Pydantic validator raises, feeding the
+        ``ValueError`` message back to the model.
+        """
+        target_model = model_override or self.primary_model
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ]
+
+        api_key = (
+            self.anthropic_api_key
+            if _provider_from_model(target_model) == "anthropic"
+            else self.openai_api_key
+        )
+
+        log.info(
+            "llm_structured_call_started",
+            model=target_model,
+            response_model=response_model.__name__,
+        )
+        t0 = time.perf_counter()
+        try:
+            result, completion = self._instructor.chat.completions.create_with_completion(
+                model=target_model,
+                api_key=api_key,
+                timeout=self.timeout,
+                messages=messages,
+                response_model=response_model,
+                max_tokens=max_tokens,
+                max_retries=max_retries,
+            )
+        except Exception as exc:
+            latency_ms = int((time.perf_counter() - t0) * 1000)
+            log.error(
+                "llm_structured_call_failed",
+                error_type=type(exc).__name__,
+                error=str(exc),
+                latency_ms=latency_ms,
+            )
+            raise
+
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        tokens_in, tokens_out = self._usage_from_completion(completion)
+        cost_usd = _estimate_cost(target_model, tokens_in, tokens_out)
+        self._record_turn_usage(
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+            latency_ms=latency_ms,
+        )
+        meta = {
+            "model": _normalise_model_name(target_model),
+            "provider": _provider_from_model(target_model),
+            "latency_ms": latency_ms,
+            "tokens_in": tokens_in,
+            "tokens_out": tokens_out,
+            "cost_usd": cost_usd,
+        }
+        log.info(
+            "llm_structured_call_completed",
+            model=meta["model"],
+            provider=meta["provider"],
+            latency_ms=latency_ms,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=cost_usd,
+        )
+        return result, meta
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -270,14 +408,11 @@ class LLMWrapper:
         max_tokens: int,
         thinking_budget: int | None,
         model_override: str | None,
-        stream: bool = False,
     ) -> dict[str, Any]:
         kwargs: dict[str, Any] = {
             "messages": messages,
             "max_tokens": max_tokens,
         }
-        if stream:
-            kwargs["stream"] = True
 
         if thinking_budget is not None:
             target_model = model_override or self.primary_model
@@ -335,13 +470,3 @@ class LLMWrapper:
             "latency_ms": latency_ms,
             "cost_usd": _estimate_cost(model, input_tokens, output_tokens),
         }
-
-
-def _extract_delta(chunk: Any) -> str:
-    """Pull the text delta out of a LiteLLM streaming chunk."""
-    try:
-        delta = chunk.choices[0].delta
-    except (AttributeError, IndexError):
-        return ""
-    content = getattr(delta, "content", None)
-    return content or ""
