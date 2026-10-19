@@ -35,6 +35,9 @@ dev = [
     "fakeredis>=2.20",
     "deepeval>=1.0",
     "fpdf2>=2.8",
+    "beautifulsoup4>=4.12",
+    "markdownify>=0.13",
+    "pyyaml>=6.0",
 ]
 
 [tool.ruff]
