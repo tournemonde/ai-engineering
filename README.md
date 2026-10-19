@@ -204,6 +204,17 @@ Los tres tests son de integración con `TestClient`, un `FakeLLMWrapper` que cap
 
 El cliente Rails (`estimator-web/`) se adaptó al flujo conversacional con un nuevo controller `ChatSessionsController` (rutas `/chat_sessions`, root re-apuntado aquí), un panel lateral con el `ProjectMetadata` actual, multipart vía `faraday-multipart` y un botón "Nueva conversación" que destruye el mirror local y arranca una sesión limpia. El endpoint transaccional `EstimationsController` se mantiene operativo para la demo histórica.
 
+## Sesión 7 — Pipeline de embeddings
+
+Módulo `app/embedding_pipeline/`: chunking estructural, `text-embedding-3-small`, `POST /embeddings/ingest`. Sample: `data/budgets_sample.json`.
+
+```bash
+uv run pytest tests/test_embedding_pipeline.py -v
+uv run python scripts/compare.py --text-a "..." --text-b "..."
+```
+
+Sanity check del enunciado: `app/embedding_pipeline/SANITY_CHECK.md`.
+
 ---
 
 > Este proyecto forma parte del **Master en AI Engineering** y es la base sobre la que se construye en directo el resto de la Sesión 04 (output estructurado, guardrails, cache semántico) y de la Sesión 05 (compresión avanzada de memoria con anclas, tier dinámico, patrón Actor-Critic-Boss).
