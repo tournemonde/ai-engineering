@@ -10,6 +10,8 @@ from openai import OpenAI
 
 from app.cache.semantic import EstimationSemanticCache
 from app.config import get_settings
+from app.embedding_pipeline.chunker import JSONStructuralChunker
+from app.embedding_pipeline.embedder import OpenAIEmbedder
 from app.services.cache import EstimationCache
 from app.services.estimation import EstimationService
 from app.services.llm_wrapper import LLMWrapper
@@ -36,6 +38,21 @@ def get_llm_wrapper() -> LLMWrapper:
         num_retries=settings.LLM_RETRIES,
         cache=get_cache(),
     )
+
+
+@lru_cache
+def get_chunker() -> JSONStructuralChunker:
+    settings = get_settings()
+    return JSONStructuralChunker(model=settings.EMBEDDING_MODEL)
+
+
+@lru_cache
+def get_embedder() -> OpenAIEmbedder | None:
+    client = get_openai_client()
+    if client is None:
+        return None
+    settings = get_settings()
+    return OpenAIEmbedder(client, model=settings.EMBEDDING_MODEL)
 
 
 @lru_cache
