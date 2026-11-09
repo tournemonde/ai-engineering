@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     AVAILABLE_MODELS: list[str] = [
         "gpt-4o-mini",
         "gpt-4o",
+        "gpt-5",
+        "gpt-5-mini",
         "claude-haiku-4-5-20251001",
         "claude-sonnet-4-5",
     ]
@@ -76,9 +78,9 @@ class Settings(BaseSettings):
     BOSS_MAX_ITERATIONS: int = 3
 
     # --- Session 6 fields (data-driven AI: persistence + ingestion + PII) ---
-    # Postgres connection string. Session 8 uses the asyncpg driver for the
-    # pgvector persistence/search path.
-    DATABASE_URL: str = "postgresql+asyncpg://estimator:estimator@localhost:5433/estimator"
+    # Postgres connection string. pgvector/pgvector:pg16 image; the extension
+    # is dormant in S06 (no CREATE EXTENSION vector) and only activates in S07.
+    DATABASE_URL: str = "postgresql+psycopg://estimator:estimator@localhost:5433/estimator"
     # Where the YAML catalog lives. Resolved relative to the working directory.
     CATALOG_PATH: Path = Path("data/catalog/catalog.yaml")
     # Root where ``CatalogSource.location`` entries are resolved against.
@@ -99,6 +101,53 @@ class Settings(BaseSettings):
     # parent budget. Prompt caching makes the (large) parent document cheap to
     # reuse across the chunks of the same budget.
     CONTEXTUAL_CHUNKER_MODEL: str = "claude-sonnet-4-5"
+
+    # --- Session 9 fields (RAG estimation: transcript → grounded estimate) ---
+    # Query understanding distills a transcript into an EstimationQuery; a small
+    # model is enough. Generation reasons over retrieved budgets, so it uses the
+    # strongest model with medium reasoning effort. Both go through LLMWrapper.
+    REFORMULATION_MODEL: str = "gpt-5-mini"
+    GENERATION_MODEL: str = "gpt-5"
+    # "high" drives a deeper, more consistent module→task decomposition (the S09
+    # article used "medium"; we raise it for the granular modular breakdown).
+    GENERATION_REASONING_EFFORT: Literal["minimal", "low", "medium", "high"] = "high"
+    # Token ceiling (reasoning + output) for the RAG structured calls. gpt-5 is a
+    # reasoning model: its reasoning tokens count against this budget, so the
+    # 4000 wrapper default leaves nothing for the JSON and the call truncates
+    # (finish_reason='length'). Generous headroom so high-effort reasoning can
+    # finish AND emit the larger nested (modules→tasks) Estimate. It is a CAP,
+    # not a target — the model only spends what it needs, so a high value adds no
+    # latency on its own.
+    GENERATION_MAX_TOKENS: int = 64000
+    # Retrieval knobs (locked defaults from the Session 9 articles).
+    RETRIEVAL_TOP_K: int = 10
+    RETRIEVAL_DISTANCE_THRESHOLD: float = 0.6
+    # Token budget for the assembled <source> context block (tiktoken cl100k_base).
+    MAX_CONTEXT_TOKENS: int = 16384
+    # Idempotency cache for POST /v1/estimate/from-transcript (seconds; 24h).
+    IDEMPOTENCY_TTL: int = 86400
+    # API keys for the two Session 9 routers. None disables the router (401 on
+    # every request) — set them in .env to enable the endpoints.
+    RETRIEVAL_API_KEY: str | None = None
+    ESTIMATE_API_KEY: str | None = None
+
+    # --- Session 10 fields (hybrid search + cross-encoder reranking) ---
+    # Default retrieval mode. "vector" reproduces the Session 9 baseline; "hybrid"
+    # fuses the dense and lexical (full-text) branches with RRF. Switchable per
+    # request (RetrievalRequest.search_mode) and at runtime (RuntimeRetrievalConfig).
+    RETRIEVAL_SEARCH_MODE: Literal["vector", "hybrid"] = "vector"
+    # Whether the cross-encoder reranks by default. Off keeps the baseline cheap;
+    # the recall-then-rerank path turns on per request / at runtime.
+    RERANKER_ENABLED: bool = False
+    # Multilingual cross-encoder (ES+EN), small enough for CPU at teaching latency.
+    RERANKER_MODEL: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    # Recall width before reranking/fusion (recall-then-rerank): retrieve this many
+    # candidates cheaply, then the cross-encoder rescores them down to RERANK_TOP_N.
+    RETRIEVAL_RECALL_TOP_K: int = 50
+    RERANK_TOP_N: int = 5
+    # RRF smoothing constant (Cormack et al. default). Larger = a document must
+    # rank well in BOTH branches to win; smaller = a single #1 can dominate.
+    RRF_K: int = 60
 
     @model_validator(mode="after")
     def validate_at_least_one_api_key(self) -> "Settings":
