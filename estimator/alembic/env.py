@@ -1,18 +1,22 @@
-"""Alembic migration environment for Session 6+8 persistence layers."""
+"""Alembic migration environment for the persistence layer (Sessions 6 + 8).
+
+The DB URL is read from ``app.config.Settings`` (not from alembic.ini) so the
+container, the dev host and CI all use the same source of truth. Migrations are
+discovered by importing the model modules: every SQLAlchemy model registered
+against ``Base.metadata`` becomes visible to Alembic's autogenerate.
+"""
 from __future__ import annotations
 
-import asyncio
 from logging.config import fileConfig
 
 from alembic import context
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import pool
-from sqlalchemy.engine import Connection
-from sqlalchemy.ext.asyncio import async_engine_from_config
+from sqlalchemy import engine_from_config, pool
+from sqlalchemy.dialects.postgresql.base import ischema_names
 
 from app.config import get_settings
-from app.foundation.persistence.models import Base  # noqa: F401
-from app.generation.rag.store import models as _rag_store_models  # noqa: F401
+from app.foundation.persistence.models import Base  # noqa: F401 — ensure models are imported
+import app.generation.rag.store.models  # noqa: F401 — register S8 tables on Base.metadata
 
 config = context.config
 
@@ -21,44 +25,40 @@ if config.config_file_name is not None:
 
 config.set_main_option("sqlalchemy.url", get_settings().DATABASE_URL)
 
+# Teach reflection about the ``vector`` column type. Without this,
+# ``alembic check`` / autogenerate against a DB that already has vector
+# columns cannot map them back and produces inconsistent diffs.
+ischema_names["vector"] = Vector
+
 target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    """Run migrations in 'offline' mode."""
+    """Generate SQL without a live connection — used by ``alembic upgrade --sql``."""
     context.configure(
         url=config.get_main_option("sqlalchemy.url"),
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={"paramstyle": "named"},
     )
-
     with context.begin_transaction():
         context.run_migrations()
 
 
-def do_run_migrations(connection: Connection) -> None:
-    """Run migrations with a live connection."""
-    connection.dialect.ischema_names["vector"] = Vector
-    context.configure(connection=connection, target_metadata=target_metadata)
-    with context.begin_transaction():
-        context.run_migrations()
-
-
-async def run_migrations_online() -> None:
-    """Run migrations in 'online' mode with async engine."""
-    connectable = async_engine_from_config(
+def run_migrations_online() -> None:
+    """Apply migrations against a live database connection."""
+    connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
-
-    async with connectable.connect() as connection:
-        await connection.run_sync(do_run_migrations)
-    await connectable.dispose()
+    with connectable.connect() as connection:
+        context.configure(connection=connection, target_metadata=target_metadata)
+        with context.begin_transaction():
+            context.run_migrations()
 
 
 if context.is_offline_mode():
     run_migrations_offline()
 else:
-    asyncio.run(run_migrations_online())
+    run_migrations_online()

@@ -28,8 +28,12 @@ from app.ingestion.loaders.filesystem import FileSystemLoader
 from app.ingestion.parsers.registry import ParserRegistry, default_registry
 from app.generation.cag.exact import EstimationCache
 from app.domain.estimation_service import EstimationService
-from app.foundation.llm.runtime_config import RuntimeModelConfig
+from app.foundation.llm.runtime_config import RuntimeModelConfig, RuntimeRetrievalConfig
 from app.foundation.llm.wrapper import LLMWrapper
+from app.foundation.persistence.database import get_async_session_factory
+from app.generation.rag.ingest_service import RagIngestService
+from app.generation.rag.retriever import SemanticRetriever
+from app.generation.rag.store.repository import ChunkStore
 from app.generation.conversation.store import SessionStore
 
 log = structlog.get_logger()
@@ -50,6 +54,24 @@ def get_runtime_config() -> RuntimeModelConfig:
     """
     settings = get_settings()
     return RuntimeModelConfig.from_url(settings.REDIS_URL, settings)
+
+
+@lru_cache
+def get_runtime_retrieval_config() -> RuntimeRetrievalConfig:
+    """Redis-backed override store for the Session 10 retrieval toggles
+    (search mode + reranking), read per call so a flip in the Ajustes UI takes
+    effect on the next retrieval without a restart."""
+    settings = get_settings()
+    return RuntimeRetrievalConfig.from_url(settings.REDIS_URL, settings)
+
+
+@lru_cache
+def get_reranker():
+    """Cross-encoder reranker singleton (Session 10). The model loads lazily on
+    the first rerank, so building this is cheap and import-time has no torch cost."""
+    from app.generation.rag.retrieval.reranker import CrossEncoderReranker
+
+    return CrossEncoderReranker.from_settings()
 
 
 @lru_cache
@@ -93,6 +115,64 @@ def get_embedder() -> OpenAIEmbedder | None:
         log.warning("embedder_disabled", reason="no_openai_key")
         return None
     return OpenAIEmbedder(client=client, model=settings.EMBEDDING_MODEL)
+
+
+# --- Session 8: pgvector persistence + semantic search ---------------------
+
+
+@lru_cache
+def get_chunk_store() -> ChunkStore:
+    """Stateless async data-access layer over documents/chunks."""
+    return ChunkStore()
+
+
+@lru_cache
+def get_rag_ingest_service() -> RagIngestService | None:
+    """Chunk → embed → persist orchestration. ``None`` without an OpenAI key
+    (mirrors ``get_embedder``); the router maps that to a 500."""
+    embedder = get_embedder()
+    if embedder is None:
+        return None
+    return RagIngestService(
+        chunker=get_chunker(),
+        embedder=embedder,
+        session_factory=get_async_session_factory(),
+        store=get_chunk_store(),
+    )
+
+
+@lru_cache
+def get_semantic_retriever() -> SemanticRetriever | None:
+    """Query-side counterpart of the ingest service. Same ``None`` contract."""
+    embedder = get_embedder()
+    if embedder is None:
+        return None
+    return SemanticRetriever(
+        embedder=embedder,
+        session_factory=get_async_session_factory(),
+        store=get_chunk_store(),
+    )
+
+
+# --- Session 9: RAG estimation pipeline (transcript → grounded estimate) ----
+
+
+@lru_cache
+def get_idempotency_store():
+    """Idempotency cache for ``POST /v1/estimate/from-transcript`` (singleton).
+
+    Redis-backed when ``REDIS_URL`` is reachable, in-process dict otherwise."""
+    from app.generation.rag.idempotency import IdempotencyStore
+
+    return IdempotencyStore.from_settings(get_settings())
+
+
+@lru_cache
+def get_token_encoder():
+    """tiktoken ``cl100k_base`` encoder used for the context token budget."""
+    import tiktoken
+
+    return tiktoken.get_encoding("cl100k_base")
 
 
 @lru_cache
