@@ -1,0 +1,62 @@
+{
+  "query_id": "Q1",
+  "retrieved_chunk_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8
+  ],
+  "report": {
+    "grounded_lines": [
+      {
+        "module": "Authentication & Access",
+        "task": "OAuth 2.0 authentication backend",
+        "status": "grounded",
+        "cited_chunk_ids": [
+          1
+        ],
+        "dangling_chunk_ids": []
+      },
+      {
+        "module": "Payments & Billing",
+        "task": "PSD2 open banking connectors",
+        "status": "grounded",
+        "cited_chunk_ids": [
+          2
+        ],
+        "dangling_chunk_ids": []
+      },
+      {
+        "module": "Core Domain",
+        "task": "Transaction ledger service",
+        "status": "grounded",
+        "cited_chunk_ids": [
+          3
+        ],
+        "dangling_chunk_ids": []
+      },
+      {
+        "module": "Notifications",
+        "task": "Push and email notifications",
+        "status": "grounded",
+        "cited_chunk_ids": [
+          4
+        ],
+        "dangling_chunk_ids": []
+      }
+    ],
+    "dangling_lines": [],
+    "insufficient_lines": [],
+    "fabricated_chunk_ids": []
+  },
+  "estimate_summary": {
+    "confidence": "high",
+    "total_engineer_days": 680,
+    "modules": 4,
+    "tasks": 4
+  }
+}

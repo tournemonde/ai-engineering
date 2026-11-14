@@ -1,0 +1,45 @@
+{
+  "description": "Session 11 citation verification sample. Intentionally includes a dangling chunk_id=999 to prove detectability.",
+  "retrieved_chunk_ids": [
+    101,
+    102
+  ],
+  "report": {
+    "grounded_lines": [
+      {
+        "module": "Authentication",
+        "task": "OAuth2 backend",
+        "status": "grounded",
+        "cited_chunk_ids": [
+          101
+        ],
+        "dangling_chunk_ids": []
+      }
+    ],
+    "dangling_lines": [
+      {
+        "module": "Authentication",
+        "task": "Invented biometric login",
+        "status": "dangling",
+        "cited_chunk_ids": [
+          999
+        ],
+        "dangling_chunk_ids": [
+          999
+        ]
+      }
+    ],
+    "insufficient_lines": [
+      {
+        "module": "Authentication",
+        "task": "Novel fraud ML model",
+        "status": "insufficient",
+        "cited_chunk_ids": [],
+        "dangling_chunk_ids": []
+      }
+    ],
+    "fabricated_chunk_ids": [
+      999
+    ]
+  }
+}
