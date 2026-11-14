@@ -10,7 +10,7 @@ from __future__ import annotations
 from datetime import date
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 # Closed universe of client sectors present in the sample dataset. Kept as a
 # Literal so a typo or an unexpected sector fails validation loudly instead of
@@ -254,6 +254,24 @@ class SourceCitation(BaseModel):
     used_for: str = Field(description="What this source contributed to the estimate.")
 
 
+class SourceReference(BaseModel):
+    """Per-task citation with a verifiable locator into the retrieved context.
+
+    Session 11: structural integrity is checked by ``verify_citations`` — every
+    ``chunk_id`` must appear in the chunks that were actually passed to the LLM.
+    ``evidence`` should be a verbatim span or figure copied from that chunk.
+    """
+
+    chunk_id: int = Field(description="DB id of the retrieved chunk (RetrievedChunk.id).")
+    document_id: str = Field(
+        description="Parent historical document id (budget_id / source_id / document_id)."
+    )
+    evidence: str = Field(
+        min_length=1,
+        description="Verbatim span or figure from the source that backs this task.",
+    )
+
+
 class Assumption(BaseModel):
     """An estimate component NOT backed by any retrieved source."""
 
@@ -265,9 +283,10 @@ class Assumption(BaseModel):
 class TaskItem(BaseModel):
     """One concrete engineering task inside a functional module, in engineer-days.
 
-    ``sources`` cite the historical chunk(s) the task was derived from; a task
-    with no historical analog is left uncited and should surface as an
-    :class:`Assumption` instead.
+    Session 11: each task carries ``grounded`` plus ``sources`` as
+    :class:`SourceReference` objects (chunk id + document id + evidence). A task
+    with no historical analog sets ``grounded=False``, leaves ``sources`` empty
+    and must not invent ``engineer_days``.
     """
 
     name: str
@@ -277,9 +296,37 @@ class TaskItem(BaseModel):
         ge=0,
         description="Effort in engineer-days. None in the structure-only generation "
         "mode (Session 10): the LLM proposes the module→task structure and the hours "
-        "are derived afterwards by per-task vector search, not inferred here.",
+        "are derived afterwards by per-task vector search, not inferred here. Also "
+        "None when grounded=False (insufficient historical support).",
     )
-    sources: list[int] = Field(default_factory=list, description="Chunk ids that back this task.")
+    grounded: bool = Field(
+        default=False,
+        description="True when this task is backed by retrieved sources; False when "
+        "there is no sufficient historical analog.",
+    )
+    sources: list[SourceReference] = Field(
+        default_factory=list,
+        description="Verifiable sources for this task. Non-empty iff grounded is True.",
+    )
+
+    @model_validator(mode="after")
+    def _grounded_integrity(self) -> TaskItem:
+        """Enforce grounded ↔ sources and ban invented hours on ungrounded tasks."""
+        if self.grounded and not self.sources:
+            raise ValueError(
+                f"Task '{self.name}': grounded=True requires at least one SourceReference."
+            )
+        if not self.grounded and self.sources:
+            raise ValueError(
+                f"Task '{self.name}': grounded=False must not carry sources "
+                "(use grounded=True or clear sources)."
+            )
+        if not self.grounded and self.engineer_days is not None:
+            raise ValueError(
+                f"Task '{self.name}': grounded=False must not invent engineer_days "
+                "(leave them null / mark as insufficient)."
+            )
+        return self
 
 
 class WorkModule(BaseModel):

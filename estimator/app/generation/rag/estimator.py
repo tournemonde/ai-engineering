@@ -31,7 +31,7 @@ from app.generation.rag.prompt_builder import (
 from app.generation.rag.query_reformulator import compose_search_text, reformulate_query
 from app.generation.rag.retrieval.pipeline import retrieve
 from app.generation.rag.schemas import Estimate, EstimationQuery
-from app.generation.rag.validation import check_coherence, validate_citations
+from app.generation.rag.validation import check_coherence, verify_citations
 
 log = structlog.get_logger()
 
@@ -262,16 +262,27 @@ async def estimate_from_transcript(
         estimate = await generate_estimate(context_block, structured_query=query)
 
     # 6. Validate citations; one corrective retry on fabricated ids.
-    fabricated = validate_citations(estimate, kept)
+    citation_report = verify_citations(
+        estimate, {chunk.id for chunk in kept}, request_id=request_id
+    )
+    fabricated = citation_report.fabricated_chunk_ids
     if fabricated:
         feedback = (
             f"your previous response cited invalid source ids: {fabricated}. "
-            "Only cite ids that appear in the <sources> block."
+            "Only cite ids that appear in the <sources> block. Every grounded "
+            "task needs SourceReference.chunk_id + document_id + verbatim evidence."
         )
         with log_stage("citation_retry", request_id, fabricated=fabricated):
             estimate = await _generate(context_block, query, feedback=feedback)
-        if validate_citations(estimate, kept):
-            log.warning("citations_unrepaired", request_id=request_id)
+        citation_report = verify_citations(
+            estimate, {chunk.id for chunk in kept}, request_id=request_id
+        )
+        if citation_report.fabricated_chunk_ids:
+            log.warning(
+                "citations_unrepaired",
+                request_id=request_id,
+                fabricated=citation_report.fabricated_chunk_ids,
+            )
             estimate = estimate.model_copy(update={"confidence": "low"})
 
     # 7. Coherence guard: one repair attempt, then reject.

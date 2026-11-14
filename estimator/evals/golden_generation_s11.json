@@ -1,0 +1,37 @@
+{
+  "description": "Session 11 golden set for generation-quality evaluation (RAGAS). Extends Session 10 Q1–Q5 with expert ground_truth estimates. Hours in the corpus are converted to engineer-days as hours/8. ground_truth is the expected estimate a senior estimator would produce from the relevant historical budgets — not a pipeline transcript.",
+  "corpus": "data/budgets_sample.json",
+  "source_golden": "evals/golden_retrieval.json",
+  "queries": [
+    {
+      "id": "Q1",
+      "query": "Mobile banking application with OAuth2 authentication, PSD2 open banking compliance, strong customer authentication and a transaction ledger.",
+      "relevant_budget_ids": ["BUD-2024-001", "BUD-2024-003"],
+      "ground_truth": "Estimación de referencia (experto): app de banca móvil con OAuth2/SCA, conectores PSD2 y ledger de transacciones. Módulos principales análogos a BUD-2024-001 (OAuth ~15 d, PSD2 ~20 d, ledger ~17.5 d, notificaciones ~7.5 d) más pasarela/fraude de BUD-2024-003 solo si el brief lo exige (gateway ~27.5 d, fraude ~25 d, conciliación ~15 d). Total orientativo 60–90 engineer-days según si se incluye pasarela de pagos completa. Confianza media-alta cuando el retrieval trae BUD-2024-001; baja si solo aparecen presupuestos e-commerce."
+    },
+    {
+      "id": "Q2",
+      "query": "Headless e-commerce storefront with a product catalog, shopping cart checkout and personalized product recommendations.",
+      "relevant_budget_ids": ["BUD-2024-005", "BUD-2024-006", "BUD-2024-007", "BUD-2024-017"],
+      "ground_truth": "Estimación de referencia (experto): storefront headless con catálogo, checkout y recomendaciones. Análogo principal BUD-2024-005 (catálogo ~19 d, cart/checkout ~17.5 d, recomendaciones ~14 d, PWA ~7.5 d → ~58 engineer-days). BUD-2024-017 aporta un MVP más pequeño (~20 d) como cota inferior. Marketplace multi-vendor (BUD-2024-006) y grocery delivery (BUD-2024-007) son distractores cercanos: no deben inflar pagos a vendors ni rutas de entrega. Total orientativo 50–65 engineer-days."
+    },
+    {
+      "id": "Q3",
+      "query": "Telemedicine platform for patient appointment scheduling and video consultations with HL7/FHIR integration and clinical records.",
+      "relevant_budget_ids": ["BUD-2024-009", "BUD-2024-010"],
+      "ground_truth": "Estimación de referencia (experto): plataforma de telemedicina con citas, vídeo y FHIR. Análogo principal BUD-2024-009 (FHIR ~24 d, scheduling ~19 d, vídeo ~20 d, consentimiento ~7.5 d → ~70 engineer-days). BUD-2024-010 (monitorización remota) es sector healthcare pero funcionalidad distinta: no debe usarse como base de horas para citas/vídeo. Total orientativo 65–75 engineer-days."
+    },
+    {
+      "id": "Q4",
+      "query": "Industrial IoT platform ingesting sensor telemetry for predictive maintenance and real-time equipment monitoring in a factory.",
+      "relevant_budget_ids": ["BUD-2024-013", "BUD-2024-015"],
+      "ground_truth": "Estimación de referencia (experto): IoT industrial con telemetría y mantenimiento predictivo. Análogo principal BUD-2024-013 (ingesta ~21 d, modelos predictivos ~25 d, SCADA ~16 d → ~62 engineer-days). BUD-2024-015 (red energética / demand-response) es industrial pero distinto dominio: útil solo como apoyo tangential, no como plantilla de horas. Total orientativo 55–70 engineer-days."
+    },
+    {
+      "id": "Q5",
+      "query": "Real-time payments gateway with fraud detection, transaction reconciliation and a double-entry ledger.",
+      "relevant_budget_ids": ["BUD-2024-003", "BUD-2024-001"],
+      "ground_truth": "Estimación de referencia (experto): pasarela de pagos en tiempo real con fraude, conciliación y ledger. Análogo principal BUD-2024-003 (gateway ~27.5 d, fraude ~25 d, conciliación ~15 d, dashboard ~7.5 d → ~75 engineer-days). BUD-2024-001 aporta ledger/PSD2 (~17.5–20 d) como apoyo. Distractors e-commerce payouts no deben usarse. Total orientativo 70–85 engineer-days."
+    }
+  ]
+}

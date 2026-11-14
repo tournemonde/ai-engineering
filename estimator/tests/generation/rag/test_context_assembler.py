@@ -29,6 +29,7 @@ def test_build_context_block_wraps_each_chunk_in_source_xml():
     block = build_context_block(chunks)
 
     assert '<source id="142"' in block
+    assert 'document_id="unknown"' in block
     assert 'sector="ecommerce"' in block
     assert 'project_year="2024"' in block
     assert 'chunk_type="budget_component"' in block
