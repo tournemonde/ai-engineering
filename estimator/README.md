@@ -234,7 +234,7 @@ El cliente Rails (`estimator-web/`) se adaptó al flujo conversacional con un nu
 
 ## Sesión 7 — Pipeline de embeddings
 
-Primer paso hacia la búsqueda semántica: convertir presupuestos históricos (JSON) en vectores. El módulo nuevo vive en `app/generation/rag/` y expone un único endpoint. En la entrega original de S7 no se persistía nada (vectores en memoria y respuesta HTTP); en S8 este flujo se refactoriza para persistir en pgvector.
+Primer paso hacia la búsqueda semántica: convertir presupuestos históricos (JSON) en vectores. El módulo nuevo vive en `app/generation/rag/` y expone un único endpoint. En la Sesión 07 no se persistía nada — los vectores se generaban en memoria y se devolvían por HTTP; **desde la Sesión 08 el endpoint persiste en pgvector** (ver la sección de la Sesión 8 más abajo).
 
 Piezas:
 
@@ -244,28 +244,14 @@ Piezas:
 
 ### Endpoint nuevo
 
-```
-POST /embeddings/ingest
-  Input  (IngestRequest):  {"budgets": [ <Budget>, ... ]}
-  Output (IngestResponse): {"chunks": [ <EmbeddedChunk>, ... ], "stats": {...}}
-  200 OK · 422 validación Pydantic · 500 error de la API de embeddings (mensaje genérico, detalle en logs)
-```
+> **Contrato actualizado en la Sesión 08.** El contrato original de la S07
+> (`{"budgets": [...]}` → chunks+vectores por HTTP, sin persistencia) fue
+> reemplazado por el contrato persistente de un documento por petición que se
+> documenta en la sección de la Sesión 8. Las piezas de esta sección (chunker,
+> embedder) siguen siendo las mismas; lo que cambió es qué se hace con los
+> vectores.
 
-Aparece en Swagger (`http://localhost:8000/docs`) y se puede invocar desde ahí con el sample de datos.
-
-Desde línea de comandos, alimentando los 15 presupuestos de ejemplo (`data/budgets_sample.json` es un array; el endpoint espera `{"budgets": [...]}`):
-
-```bash
-# httpie (envuelve el array en el campo "budgets")
-http POST :8000/embeddings/ingest budgets:=@data/budgets_sample.json
-
-# curl equivalente
-curl -s -X POST http://localhost:8000/embeddings/ingest \
-  -H 'Content-Type: application/json' \
-  -d "{\"budgets\": $(cat data/budgets_sample.json)}" | python -m json.tool | head -40
-```
-
-Con el sample: 15 presupuestos → 52 chunks → ~4.1k tokens → coste estimado ~$0.00008.
+Con el sample completo: 17 presupuestos → 60 chunks (`text-embedding-3-small`, 1536 dims).
 
 ### Script CLI `compare.py`
 
@@ -312,7 +298,7 @@ uv run python scripts/compare_chunkers.py --strategies all --queries all \
   --show-stats --show-cost --output app/generation/rag/COMPARISON_REPORT.md
 ```
 
-Las estrategias `semantic`, `propositional` y `contextual_retrieval` llaman a APIs externas durante la ingesta (necesitan `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) y reportan su coste en `chunking_done`. `sentence_window` usa NLTK (`punkt`/`punkt_tab`, descarga perezosa).
+Las estrategias `semantic`, `propositional` y `contextual_retrieval` llaman a APIs externas durante la ingesta (necesitan `OPENAI_API_KEY` / `ANTHROPIC_API_KEY`) y reportan su coste en `chunking_done`. `sentence_window` usa NLTK (`punkt`/`punkt_tab`, descarga perezosa). El endpoint de comparación no persiste nada — la persistencia vectorial vive en `/embeddings/ingest` desde la **Sesión 08**.
 
 ### Dependencias y scope
 
@@ -322,81 +308,103 @@ Las estrategias `semantic`, `propositional` y `contextual_retrieval` llaman a AP
 - **Fuera de scope** → **Sesión 08**: persistencia vectorial (pgvector), búsqueda semántica / retrieval real y métricas formales de retrieval (recall@k, NDCG).
 - El guion del directo está en `guides/session-7-live-guide.md` (git-ignored, material de instructor).
 
-## Sesión 8 — Persistencia pgvector + búsqueda semántica
+## Sesión 8 — Persistencia vectorial y búsqueda semántica
 
-S8 convierte el pipeline de S7 en un flujo persistente:
+El pipeline de la S07 deja de devolver vectores por HTTP y los persiste en Postgres + pgvector (`pgvector/pgvector:pg16`, ya presente en compose). Schema gestionado con Alembic (`alembic/versions/0002_session8_pgvector.py`: extensión `vector` + tablas `documents` y `chunks`). Código nuevo: `app/generation/rag/store/` (modelos ORM + repositorio async con `asyncpg`), `app/generation/rag/ingest_service.py` (orquestación chunk → embed → persist) y `app/generation/rag/retriever.py` (búsqueda). El stack async convive con el sync de la S06: una sola `DATABASE_URL`, el engine async deriva el driver.
 
-- `POST /embeddings/ingest` ya no devuelve vectores; persiste un documento y sus chunks embebidos en Postgres+pgvector.
-- `POST /search` embebe la query y devuelve top-k chunks por `cosine_distance`.
+### Endpoints
 
-### Contrato `POST /embeddings/ingest` (S8)
+```
+POST /embeddings/ingest   (refactorizado: ahora persiste)
+  Input:  {"source_path": "...", "document_type": "historical_budget", "content": <Budget>}
+  Output: {"document_id": 1, "chunks_created": 4, "embedding_dimension": 1536, "ingestion_time_ms": 2431}
+  200 OK · 409 {"detail": "Document already ingested", "document_id": N} · 422 · 500
+  Todo en UNA transacción: si el embedder falla, rollback — sin documents huérfanos.
 
-```json
-{
-  "source_path": "data/budgets/budget_2024_q1_fintech.json",
-  "document_type": "historical_budget",
-  "content": { "...": "Budget JSON normalizado" }
-}
+POST /search
+  Input:  {"query": "REST API with OAuth authentication", "k": 5}
+  Output: {"query", "k", "search_time_ms", "results": [{chunk_id, document_id, chunk_type, content, distance, metadata}]}
+  k-NN por distancia coseno (operador <=>) vía SQL. Sin índice vectorial: sequential scan.
 ```
 
-Respuesta:
+### Script `query_examples.py`
 
-```json
-{
-  "document_id": 42,
-  "chunks_created": 17,
-  "embedding_dimension": 1536,
-  "ingestion_time_ms": 1240
-}
-```
-
-Duplicado (`source_path` ya ingestado): `409` con `{"detail":{"detail":"Document already ingested","document_id":42}}`.
-
-### Contrato `POST /search` (S8)
-
-```json
-{
-  "query": "REST API with OAuth authentication for fintech sector",
-  "k": 5
-}
-```
-
-Respuesta:
-
-```json
-{
-  "query": "...",
-  "k": 5,
-  "search_time_ms": 87,
-  "results": [
-    {
-      "chunk_id": 156,
-      "document_id": 12,
-      "chunk_type": "budget_component",
-      "content": "...",
-      "distance": 0.231,
-      "metadata": {}
-    }
-  ]
-}
-```
-
-### Decisiones de diseño (justificación del ejercicio)
-
-- **Dos tablas (`documents` + `chunks`) y no una:** un documento produce N chunks; separar evita duplicar metadata por fila y permite `ON DELETE CASCADE`.
-- **`metadata` en `JSONB`:** campos estables van tipados; campos variables/evolutivos viven en JSONB con índice GIN para consultas por clave.
-- **`cosine_distance`:** alinea con embeddings normalizados de OpenAI y con la operator class `vector_cosine_ops` que se trabajará al introducir índices vectoriales.
-- **Sin índice vectorial todavía:** deliberado para tener baseline de sequential scan antes del tuning/índices en directo.
-
-### Comandos útiles S8
+Ingesta el corpus completo (idempotente: los 409 se saltan) y lanza 5 queries que ejercitan ángulos distintos (match directo, reformulación semántica, dominio ajeno, ambigua, muy específica). Su salida real contra el corpus está en [`output_examples.txt`](output_examples.txt).
 
 ```bash
-# Aplicar migraciones
-uv run alembic upgrade head
-
-# Cargar ejemplos de búsqueda (service corriendo)
-uv run python query_examples.py --base-url http://localhost:8000 --k 5
+docker compose up -d
+docker compose run --rm estimator python scripts/query_examples.py
 ```
+
+No hay tests de integración con BD viva (no existen fixtures de Postgres en la suite); la evidencia end-to-end es este script. Los tests HTTP usan fakes vía `dependency_overrides`.
+
+### Decisiones de schema
+
+- **Dos tablas y no una.** Un presupuesto produce N chunks: es un uno-a-muchos real. Una tabla única duplicaría la metadata del documento en cada fila y perdería integridad referencial. Con `ON DELETE CASCADE`, borrar un presupuesto elimina sus chunks automáticamente; `documents` posee la procedencia (`source_path`, `ingested_at`), `chunks` posee los vectores.
+- **`metadata` como JSONB y no columnas tipadas.** Lo estable (tipo de documento, tipo de chunk, fechas) va en columnas tipadas; lo que el chunker puede enriquecer (sector, tecnologías, horas) va a JSONB. El índice GIN permite consultar por claves arbitrarias sin una migración por cada clave nueva. Una columna se promociona a tipada solo cuando se convierte en filtro caliente.
+- **`cosine_distance` y no L2 ni inner product.** Los embeddings de OpenAI vienen normalizados, así que el ranking sería equivalente; usamos coseno por convención de la literatura RAG y, sobre todo, para quedar alineados con la operator class `vector_cosine_ops` del índice HNSW que se añade en el directo. Si la query usa un operador y el índice está construido con otra operator class, Postgres ignora el índice **en silencio** y cae a sequential scan.
+- **Sin índice vectorial todavía (deliberado).** Con 17 presupuestos / 60 chunks el sequential scan responde en pocos cientos de ms y es el baseline contra el que el directo mide el impacto del HNSW. Añadirlo ahora ocultaría justamente lo que queremos observar.
+- **`embedding` nullable.** Permite insertar el chunk y rellenar el vector después (ingesta asíncrona, sesiones posteriores). En esta sesión chunk+embedding se escriben atómicamente.
+- **`vector(1536)` hardcodeado.** Es la dimensionalidad de `text-embedding-3-small`; cambiarla implica re-embedear todo el corpus, no es configuración dinámica.
+
+**Fuera de scope (se construye en el directo):** índices vectoriales (HNSW/IVFFlat), filtros por metadata en SQL, búsqueda híbrida (full-text + vector) y tuning de Postgres.
+
+## Live Session 08 — Indexación vectorial y operación
+
+Material de la sesión en vivo que cierra el Módulo 3: cómo se **indexa** (HNSW), **optimiza** (halfvec) y **opera** (monitorización + mantenimiento) la base de datos vectorial construida en el previo. Foco exclusivo en la capa de datos — el retrieval llega en las Sesiones 09 y 10.
+
+### Scripts Python (`scripts/*_s08.py`)
+
+Todos se ejecutan con `docker compose run --rm estimator python scripts/<script>` (o `docker compose exec estimator python scripts/<script>` con el stack levantado). Reutilizan la configuración, la sesión async y el embedder del proyecto; `s08_common.py` es el módulo compartido (no es un script).
+
+| Script | Qué hace |
+|---|---|
+| `measure_baseline_s08.py` | Latencia SQL de las 5 queries del benchmark (warm-up + 2 mediciones, media y desviación). Ejecutar antes y después de crear el índice. Imprime al final el literal pgvector de la primera query para los demos en psql. |
+| `sweep_ef_search_s08.py` | Barre `hnsw.ef_search` en [10..200], mide latencia y recall contra la verdad de fondo (seq scan forzado) e imprime la tabla con la recomendación ★. |
+| `compare_indexes_s08.py` | Las 5 queries contra el índice `vector` y el `halfvec` (forzados por expresión, sin dropear nada): top-5, overlap y latencias lado a lado. |
+| `report_index_sizes_s08.py` | Estado de los índices de `chunks`: tipo (btree/gin/hnsw), tamaño, `idx_scan`, último uso. Ejecutar antes/después de cada decisión. |
+| `insert_synthetic_chunks_s08.py` | Inserta chunks sintéticos con embeddings **reales** (`count` posicional, default 100). Con `30000` engorda el corpus en el pre-flight para que el baseline sin índice sea medible. Limpieza: `DELETE FROM documents WHERE document_type = 'synthetic_test';` |
+
+### Snippets SQL (`scripts/sql_s08/`)
+
+Se ejecutan en psql, en este orden durante el directo. psql vive en el contenedor de Postgres (que no monta `scripts/`), así que: redirigir el archivo o pegar bloques.
+
+```bash
+# Archivo completo:
+docker compose exec -T estimator-postgres psql -U estimator -d estimator \
+  < estimator/scripts/sql_s08/01_create_hnsw.sql
+# Interactivo (pegar bloques):
+docker compose exec estimator-postgres psql -U estimator -d estimator
+```
+
+| Orden | Snippet | Bloque del directo |
+|---|---|---|
+| 1 | `01_create_hnsw.sql` | Construcción del índice HNSW (`vector_cosine_ops`, m=16, ef_construction=128) |
+| 2 | `02_test_antipatron.sql` | El antipatrón silencioso: `<=>` vs `<->` con `EXPLAIN ANALYZE` |
+| 3 | `03_create_halfvec.sql` | Índice halfvec paralelo sobre `(embedding::halfvec(1536))` |
+| 4 | `04_monitoring_queries.sql` | Monitorización con `pg_stat_user_indexes` |
+| 5 | `05_maintenance_cycle.sql` | ANALYZE → VACUUM → REINDEX CONCURRENTLY |
+
+### Operational queries
+
+La query canónica de monitorización — para tenerla a mano siempre:
+
+```sql
+SELECT indexrelname, idx_scan, last_idx_scan,
+       pg_size_pretty(pg_relation_size(indexrelid)) AS size
+FROM pg_stat_user_indexes
+WHERE relname = 'chunks'
+ORDER BY idx_scan DESC;
+```
+
+Si un índice vectorial tiene `idx_scan = 0` después de servir queries semánticas: casi seguro el operador de la query no coincide con la operator class del índice (p. ej. `<->` contra `vector_cosine_ops`). Verificación de operator classes y estadísticas de tabla: en `scripts/sql_s08/04_monitoring_queries.sql`.
+
+El tuning de Postgres para builds de índices vive en `docker-compose.yml` (servicio `estimator-postgres`): `shm_size`, `shared_buffers`, `maintenance_work_mem`, `max_parallel_maintenance_workers`. Valores conservadores de desarrollo; en producción escalan con la RAM.
+
+### Entregable post-directo (a Lia)
+
+1. Repositorio actualizado: índice halfvec activo, flags de tuning en compose, queries de monitorización en el README.
+2. Documento corto con los números observados en **vuestro** barrido de `ef_search` (tabla del script) y la decisión razonada del valor adoptado: qué recall ganáis y qué latencia pagáis frente a las alternativas.
 
 ---
 

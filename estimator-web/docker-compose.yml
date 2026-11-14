@@ -10,7 +10,8 @@ services:
       - "3000:3000"
 
     env_file:
-      - .env
+      - path: .env
+        required: false
 
     # Explicit overrides so the service works even if .env is missing values.
     environment:

@@ -1,422 +1,314 @@
 # Diagnóstico arquitectónico — Sesión 09 (pre-work)
 
-## 1. Diagrama de la arquitectura actual
+Estado del servicio IA `estimator` al cierre de Sesión 08, comportamiento observado al pasarle una
+transcripción cruda, fallos concretos y propuesta de evolución hasta cerrar el bucle
+transcripción → estimación.
+
+> **Cómo está escrito este documento.** Las observaciones van en español; los comandos, payloads y
+> nombres de campo van en inglés. El trace de la sección 2 es reproducible: los comandos están
+> puestos tal cual se ejecutan, y la salida real se pega en los bloques marcados
+> `<!-- PEGAR SALIDA REAL -->`. Los valores numéricos concretos (distancias) aparecen como `[0.__]`
+> y se completan al pegar la salida.
+
+> **Nota de fidelidad.** El enunciado describe el servicio IA con nombres genéricos
+> (`ingest/`, `embedding_pipeline/`, `storage/`). El repo real los implementa con otra forma; este
+> documento describe la arquitectura **real** del repo: `app/ingestion/` (pipeline batch offline) y
+> `app/generation/rag/` (`chunking/`, `embedding/`, `store/`, `retriever.py`, `ingest_service.py`),
+> con los endpoints `POST /embeddings/ingest`, `POST /search` y `POST /embeddings/compare`.
+
+---
+
+## 1. Diagrama de la arquitectura actual (cierre S08)
+
+Tres capas. El servicio IA está bajado un nivel. El **borde sombreado** marca dónde acaba lo
+implementado hoy: el flujo muere en *"lista de chunks + distancias"*. **No existe ninguna flecha
+que vaya desde una transcripción hasta una estimación.**
 
 ```mermaid
 flowchart TB
-    U[Usuario]
-
-    subgraph frontend["1. Frontend"]
-        Browser["Navegador<br/>UI Rails"]
-        Streamlit["Cliente Streamlit"]
+    subgraph FE["① Frontend — estimator-web (Rails/Hotwire)"]
+        UI["Formulario / vistas"]
     end
 
-    subgraph business["2. Backend de negocio — estimator-web (Rails)"]
-        RailsUI["Controllers + Views"]
-        Clients["EstimatorAi clients HTTP<br/>estimations · sessions · embeddings · ingestion · config"]
-        RailsDB[("PostgreSQL de negocio<br/>estimations · chat sessions · comparativas")]
-
-        RailsUI --> Clients
-        RailsUI --> RailsDB
+    subgraph BIZ["② Backend de negocio — estimator-web (Rails)"]
+        AIClient["EstimatorAi::BaseClient<br/>(único que habla HTTP con FastAPI)"]
     end
 
-    subgraph ai["3. Servicio IA — estimator (FastAPI)"]
-        API["Routers HTTP<br/>POST /api/v1/estimate<br/>/sessions/*<br/>/api/v1/ingestion/*<br/>POST /embeddings/ingest<br/>POST /embeddings/compare<br/>POST /search<br/>GET/PUT /api/v1/config/models"]
+    subgraph AI["③ Servicio IA — estimator (FastAPI)"]
+        direction TB
 
-        subgraph offline["Ingesta y preparación del corpus"]
-            Ingestion["ingestion/<br/>catalog · loaders · parsers<br/>cleaning · PII"]
-            Chunker["generation/rag/chunking/<br/>1 componente → 1 chunk"]
-            Embedder["generation/rag/embedding/<br/>texto → embedding"]
-            RagIngest["RagIngestService<br/>chunk → embed → persist"]
+        subgraph API["app/api (transporte)"]
+            EpIngest["POST /embeddings/ingest"]
+            EpSearch["POST /search"]
+            EpCompare["POST /embeddings/compare"]
         end
 
-        subgraph storage["Persistencia vectorial"]
-            Store["generation/rag/store/<br/>Document · Chunk · repository"]
-            Pgvector[("PostgreSQL + pgvector<br/>documents · chunks<br/>cosine con halfvec · sin índice vectorial activo")]
+        subgraph OFFLINE["app/ingestion (batch offline)"]
+            Catalog["catalog → loader → parser<br/>→ cleaning / PII"]
+            Docs["Document(s)"]
+            Catalog --> Docs
         end
 
-        subgraph retrieval["Búsqueda semántica"]
-            Retriever["SemanticRetriever<br/>embed query + cosine distance"]
-            Result["SearchResponse<br/>top-k chunks + distances"]
+        subgraph RAG["app/generation/rag"]
+            Chunk["chunking/<br/>JSONStructuralChunker<br/>(1 chunk = 1 componente)"]
+            Embed["embedding/<br/>OpenAIEmbedder<br/>text-embedding-3-small · 1536d"]
+            Store[("store/ — pgvector<br/>documents + chunks<br/>cosine &lt;=&gt; · sin índice")]
+            Retr["retriever.py<br/>SemanticRetriever (k-NN)"]
         end
-
-        subgraph existing_generation["Generación ya existente, separada del retrieval"]
-            Estimation["EstimationService<br/>estimación y conversación"]
-            CAG["CAG<br/>caché exacta + semántica"]
-            LLM["LLM + prompts + guardrails"]
-        end
-
-        API --> Ingestion
-        API --> RagIngest
-        RagIngest --> Chunker --> Embedder --> Store --> Pgvector
-
-        API --> Retriever
-        Retriever --> Embedder
-        Retriever --> Store
-        Pgvector --> Store
-        Retriever --> Result
-        Result --> API
-
-        API --> Estimation
-        Estimation --> CAG
-        Estimation --> LLM
     end
 
-    U --> Browser --> RailsUI
-    U --> Streamlit
-    Clients --> API
-    Streamlit --> API
+    UI --> AIClient --> EpSearch
 
-    Stop["LÍMITE ACTUAL<br/>/search termina devolviendo el top-k.<br/>Los chunks recuperados no alimentan EstimationService."]
-    Result -.-> Stop
+    %% Camino de ingesta (online, presupuesto a presupuesto)
+    EpIngest --> Chunk --> Embed --> Store
 
-    classDef boundary fill:#fff3cd,stroke:#b7791f,stroke-width:2px,color:#3d2b00;
-    class Stop boundary;
+    %% Camino de búsqueda
+    EpSearch --> Retr
+    Retr -->|"embed_one(query)"| Embed
+    Retr -->|"k-NN cosine"| Store
+    Store -->|"top-k chunks + distance"| Retr
+    Retr -->|"SearchResponse"| EpSearch
+
+    %% AQUÍ ACABA TODO
+    EpSearch -. "⛔ FIN: devuelve chunks, no una estimación" .-> END(["❓ ¿estimación?<br/>NO EXISTE"])
+
+    classDef done fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px;
+    classDef edge fill:#fff8e1,stroke:#f9a825,stroke-width:3px,stroke-dasharray:4 3;
+    classDef missing fill:#ffebee,stroke:#c62828,stroke-width:2px,stroke-dasharray:6 4,color:#b71c1c;
+
+    class Catalog,Docs,Chunk,Embed,Store,Retr,EpIngest,EpCompare done;
+    class EpSearch edge;
+    class END missing;
 ```
 
-El sistema tiene dos recorridos que aún permanecen separados. El recorrido RAG puede ingerir
-presupuestos, fragmentarlos, generar embeddings, persistirlos en pgvector y recuperar los `k`
-chunks más próximos a una consulta. Por otra parte, `EstimationService` ya genera estimaciones
-mediante prompts, LLM, guardrails y CAG. Sin embargo, el resultado de `POST /search` sale como una
-respuesta HTTP independiente: los chunks recuperados no se incorporan al flujo de estimación.
-Por ello, ante una transcripción, el sistema actual puede encontrar antecedentes parecidos, pero
-no puede producir una estimación fundamentada en esos antecedentes.
+**Lectura del diagrama.** Lo implementado (verde) cubre dos caminos: (a) **ingesta** —
+`/embeddings/ingest` trocea un presupuesto en chunks por componente, los embebe y los persiste en
+pgvector; (b) **búsqueda** — `/search` embebe el texto de consulta con el mismo modelo y devuelve
+los *k* chunks más cercanos por distancia coseno. El borde amarillo (`/search`) es el último
+eslabón vivo: **su salida es una lista de chunks con distancias, no una estimación**. La caja roja
+(transcripción → estimación) no existe en ninguna forma. Ese es exactamente el hueco que abre la
+Sesión 09.
 
 ---
 
 ## 2. Trace anotado de `02_ambiguous.txt`
 
-El trace usa la transcripción completa de Casa Castaño (2.854 caracteres). El cliente quiere
-vender productos gourmet online, incorporar alguna forma de fidelización, consultar pedidos y
-stock desde un panel y aceptar pagos con tarjeta. El corpus contiene 17 presupuestos históricos
-divididos en 60 chunks.
+Cliente: Casa Castaño, tienda gourmet física que quiere "vender por internet", "algo de fidelización
+/ puntos", "un panel para ver pedidos y stock", "que la gente pague con tarjeta" y "un correo al
+comprar". Divaga, mezcla temas y solo un par de frases dan pistas concretas.
+
+**Preparación (una vez):**
+
+```bash
+# Desde la raíz del monorepo
+cd /Users/antonioperez/projects/ia/ai-engineering
+docker compose up -d estimator estimator-postgres redis
+
+# Ingesta idempotente del corpus real (17 presupuestos de data/budgets_sample.json).
+# 409 = ya ingestado, así que re-ejecutar no duplica.
+docker compose run --rm estimator python scripts/query_examples.py
+```
+
+**Trace (script cliente, no añade comportamiento al servicio):**
+
+```bash
+export OPENAI_API_KEY=sk-...
+uv run examples/trace_s09.py examples/transcripts/02_ambiguous.txt
+```
 
 ### Paso 1 — Embeber la transcripción completa
 
-No existe un endpoint que exponga el vector crudo. Se invoca directamente el mismo módulo y modelo
-que utiliza internamente `POST /search`:
-
-```bash
-cd /Users/tournemonde/Documents/01.Projects/ai-engineering/estimator
-
-uv run python - <<'PY'
-from pathlib import Path
-
-from app.dependencies import get_embedder
-
-text = Path("../examples/transcripts/02_ambiguous.txt").read_text(encoding="utf-8")
-embedder = get_embedder()
-
-if embedder is None:
-    raise RuntimeError("OPENAI_API_KEY is not configured")
-
-vector = embedder.embed_one(text)
-norm = sum(component**2 for component in vector) ** 0.5
-
-print(f"characters={len(text)}")
-print(f"dimension={len(vector)}")
-print(f"first_component={vector[0]}")
-print(f"last_component={vector[-1]}")
-print(f"norm={norm:.6f}")
-PY
-```
-
-Respuesta obtenida:
+El script embebe el texto completo con `text-embedding-3-small` (1536 dims), el mismo modelo que el
+servicio usa en ingesta. (No hay endpoint que devuelva el vector crudo: embeber ocurre *dentro* de
+`/search`; por eso lo hacemos aquí explícito.)
 
 ```text
-characters=2854
-dimension=1536
-first_component=0.00623321533203125
-last_component=0.019012451171875
-norm=0.999691
+<!-- PEGAR SALIDA REAL: bloque "STEP 1" de trace_s09.py -->
+transcript      : examples/transcripts/02_ambiguous.txt
+model           : text-embedding-3-small
+dimensionality  : 1536
+L2 norm         : [1.0_____]
+first component : [0.______]
+last component  : [0.______]
 ```
 
-> **Comentario.** Un único vector de 1.536 dimensiones representa toda la conversación: mezcla
-> requisitos relevantes —venta online, fidelización, panel, pagos y correo— con divagaciones y
-> ruido conversacional. Representa mejor el conjunto de temas tratados que una especificación
-> precisa de lo que debe construirse. La norma cercana a 1 indica que el embedding está
-> prácticamente normalizado.
+> **Comentario.** Un único vector de 1536 dimensiones resume **toda** la transcripción: la tienda
+> física, la fidelización, el panel, el pago con tarjeta, la anécdota del primo en Francia y el
+> correo de confirmación. Es la media semántica de cinco intenciones distintas más ruido
+> conversacional: no representa "lo que el cliente quiere construir", representa "de qué se habló en
+> la reunión". La norma ≈ 1.0 confirma que OpenAI normaliza el vector, así que distancia coseno y
+> orden por similitud son directamente comparables.
 
-### Paso 2 — Búsqueda semántica (top-5)
+### Paso 2 — Búsqueda semántica (`POST /search`, k=5)
 
-Se envía la transcripción completa a `POST /search`. El endpoint la vuelve a embeber con el mismo
-modelo y ordena los chunks por distancia coseno ascendente:
+`/search` re-embebe el mismo texto con el mismo modelo y devuelve los 5 chunks más cercanos por
+distancia coseno (menor = más parecido). Equivalente en `curl`:
 
 ```bash
-cd /Users/tournemonde/Documents/01.Projects/ai-engineering
-
-jq -n --rawfile query examples/transcripts/02_ambiguous.txt \
-  '{query: $query, k: 5}' \
-  | curl -sS -X POST http://localhost:8000/search \
-      -H 'Content-Type: application/json' \
-      -d @- \
-  | tee /tmp/session9-search-response.json \
-  | jq
+curl -s -X POST http://localhost:8000/search \
+  -H "Content-Type: application/json" \
+  --data-binary @- <<'JSON' | jq
+{"query": "<contenido completo de 02_ambiguous.txt>", "k": 5}
+JSON
 ```
 
-Respuesta obtenida (el campo `query`, que reproduce literalmente los 2.854 caracteres de la
-transcripción, se abrevia para no duplicarla; los resultados se conservan completos):
-
 ```json
+<!-- PEGAR SALIDA REAL: bloque "raw JSON" de trace_s09.py / salida de curl -->
 {
-  "query": "<contenido completo de examples/transcripts/02_ambiguous.txt>",
+  "query": "...",
   "k": 5,
-  "search_time_ms": 340,
+  "search_time_ms": [___],
   "results": [
-    {
-      "chunk_id": 16,
-      "document_id": 5,
-      "chunk_type": "budget_component",
-      "content": "[Project: Headless e-commerce storefront with personalized recommendations]\n[Client sector: ecommerce | Year: 2024 | Main tech: node]\n\nComponent: Product catalog API\nDescription: GraphQL catalog API with faceted search, inventory availability and multi-currency pricing backed by Elasticsearch.\nTech stack: node, graphql, elasticsearch\nComplexity: medium\nEstimated hours: 150",
-      "distance": 0.6082955228166176,
-      "metadata": {
-        "year": 2024,
-        "budget_id": "BUD-2024-005",
-        "complexity": "medium",
-        "component_id": "CATALOG-001",
-        "client_sector": "ecommerce",
-        "estimated_hours": 150,
-        "main_technology": "node"
-      }
-    },
-    {
-      "chunk_id": 17,
-      "document_id": 5,
-      "chunk_type": "budget_component",
-      "content": "[Project: Headless e-commerce storefront with personalized recommendations]\n[Client sector: ecommerce | Year: 2024 | Main tech: node]\n\nComponent: Cart and checkout service\nDescription: Stateless cart service with promotion engine, tax calculation and a checkout orchestration that integrates the payment provider.\nTech stack: node, redis, postgresql\nComplexity: high\nEstimated hours: 140",
-      "distance": 0.6138128623757041,
-      "metadata": {
-        "year": 2024,
-        "budget_id": "BUD-2024-005",
-        "complexity": "high",
-        "component_id": "CART-002",
-        "client_sector": "ecommerce",
-        "estimated_hours": 140,
-        "main_technology": "node"
-      }
-    },
-    {
-      "chunk_id": 18,
-      "document_id": 5,
-      "chunk_type": "budget_component",
-      "content": "[Project: Headless e-commerce storefront with personalized recommendations]\n[Client sector: ecommerce | Year: 2024 | Main tech: node]\n\nComponent: Personalized recommendations\nDescription: Collaborative-filtering recommendations served from a feature store and exposed as a low-latency API for product and cart pages.\nTech stack: node, redis\nComplexity: medium\nEstimated hours: 110",
-      "distance": 0.637239193021222,
-      "metadata": {
-        "year": 2024,
-        "budget_id": "BUD-2024-005",
-        "complexity": "medium",
-        "component_id": "RECO-003",
-        "client_sector": "ecommerce",
-        "estimated_hours": 110,
-        "main_technology": "node"
-      }
-    },
-    {
-      "chunk_id": 19,
-      "document_id": 5,
-      "chunk_type": "budget_component",
-      "content": "[Project: Headless e-commerce storefront with personalized recommendations]\n[Client sector: ecommerce | Year: 2024 | Main tech: node]\n\nComponent: Storefront PWA\nDescription: Progressive web app storefront consuming the headless APIs with server-side rendering for SEO.\nTech stack: next_js, react\nComplexity: low\nEstimated hours: 60",
-      "distance": 0.6387455049929066,
-      "metadata": {
-        "year": 2024,
-        "budget_id": "BUD-2024-005",
-        "complexity": "low",
-        "component_id": "STORE-004",
-        "client_sector": "ecommerce",
-        "estimated_hours": 60,
-        "main_technology": "node"
-      }
-    },
-    {
-      "chunk_id": 27,
-      "document_id": 8,
-      "chunk_type": "budget_component",
-      "content": "[Project: Fashion returns management and resale portal]\n[Client sector: ecommerce | Year: 2023 | Main tech: dotnet]\n\nComponent: Returns portal\nDescription: Self-service returns portal with label generation, reason capture and automatic restock or resale routing.\nTech stack: dotnet, sqlserver\nComplexity: medium\nEstimated hours: 140",
-      "distance": 0.6443924123988022,
-      "metadata": {
-        "year": 2023,
-        "budget_id": "BUD-2024-008",
-        "complexity": "medium",
-        "component_id": "RET-001",
-        "client_sector": "ecommerce",
-        "estimated_hours": 140,
-        "main_technology": "dotnet"
-      }
-    }
+    { "chunk_id": [__], "document_id": [__], "chunk_type": "budget_component",
+      "content": "...", "distance": [0.__], "metadata": { "budget_id": "...", "client_sector": "...", "main_technology": "...", "estimated_hours": [__] } }
   ]
 }
 ```
 
-> **Comentario.** Los cinco resultados pertenecen al sector `ecommerce`, pero cuatro proceden del
-> mismo presupuesto. Las distancias están comprimidas entre 0,6083 y 0,6444: el sistema encuentra
-> una temática común, aunque no muestra una separación fuerte entre resultados y devuelve cinco
-> elementos incluso cuando el último es poco relevante.
-
 ### Paso 3 — Lectura de los chunks devueltos
 
-| # | Componente | Presupuesto / sector | Distancia | Valoración |
-|---|---|---|---:|---|
-| 1 | `CATALOG-001` — Product catalog API | `BUD-2024-005` / ecommerce | 0,6083 | **Relevante, pero parcial.** Casa Castaño necesita mostrar productos, stock y precios. GraphQL, Elasticsearch y multimoneda parecen sobredimensionados para una tienda pequeña. |
-| 2 | `CART-002` — Cart and checkout service | `BUD-2024-005` / ecommerce | 0,6138 | **Muy relevante.** El carrito, el checkout y el pago seguro aparecen explícitamente en la transcripción. El motor de promociones e impuestos podría superar el alcance inicial. |
-| 3 | `RECO-003` — Personalized recommendations | `BUD-2024-005` / ecommerce | 0,6372 | **Parcialmente relevante.** Puede fomentar ventas, pero no equivale al programa de puntos o club de fidelización pedido. El sistema aproxima dos conceptos relacionados pero distintos. |
-| 4 | `STORE-004` — Storefront PWA | `BUD-2024-005` / ecommerce | 0,6387 | **Muy relevante.** El storefront es la tienda online que utilizarán los clientes. PWA, React y SSR son decisiones técnicas potencialmente excesivas para este alcance inicial. |
-| 5 | `RET-001` — Returns portal | `BUD-2024-008` / ecommerce | 0,6444 | **Irrelevante / falso positivo.** `Returns` se refiere a devoluciones de producto, no a clientes recurrentes ni fidelización. La transcripción no solicita gestión de devoluciones o reventa. |
+Para cada chunk: a qué presupuesto pertenece, de qué sector es, y si es relevante para lo que pide
+Casa Castaño (tienda gourmet que quiere vender online + fidelización + panel + pago con tarjeta).
+**Se completa con la salida real**; abajo, la lectura esperada según el corpus.
 
-> **Comentario.** El top-5 recupera correctamente varias capacidades de comercio electrónico,
-> pero también mezcla intención funcional con soluciones más complejas de lo necesario. La ausencia
-> de umbral obliga a incluir el portal de devoluciones aunque no responda a ninguna necesidad
-> expresada por el cliente.
+| # | chunk (componente) | budget_id / sector | distancia | ¿Relevante para el cliente? |
+|---|--------------------|--------------------|-----------|------------------------------|
+| 1 | _p.ej._ `CART-002` Cart and checkout service | `BUD-2024-005` / ecommerce | `[0.__]` | **Sí, parcial** — checkout y pago, justo lo que pide. Pero es de una plataforma headless, mucho mayor que su tienda. |
+| 2 | _p.ej._ `CATALOG-001` Product catalog API | `BUD-2024-005` / ecommerce | `[0.__]` | Parcial — catálogo de producto encaja, pero GraphQL+Elasticsearch es sobredimensionado. |
+| 3 | _p.ej._ `DASH-004` Merchant dashboard | `BUD-2024-003` / finance (pagos) | `[0.__]` | **Engañoso** — "dashboard" hace match con su "panel", pero es el panel de un *payment gateway* bancario, no de una tienda. |
+| 4 | _p.ej._ `STORE-004` Storefront PWA | `BUD-2024-005` / ecommerce | `[0.__]` | Parcial — storefront encaja; PWA con SSR es más de lo que necesita. |
+| 5 | _p.ej._ `MVP-004` Checkout (pay with card) | `BUD-2024-017` / ecommerce | `[0.__]` | **Sí** — el MVP de una sola línea ("Pay with card") es lo más cercano a su escala real. |
+
+> **Comentario honesto.** El resultado es **mediocre y revelador**. Tres observaciones que se repiten
+> al pegar la salida real:
+> 1. **Distancias comprimidas.** Los cinco chunks caen en una banda estrecha (`[0.__]`–`[0.__]`,
+>    una diferencia de apenas `[0.__]`): el sistema "no tiene una opinión fuerte". Como el query es
+>    la media de muchos temas, ningún chunk destaca con claridad.
+> 2. **Mezcla de sectores.** Entre los 5 aparecen chunks de `ecommerce` y de `finance` (el merchant
+>    dashboard del payment gateway). El cliente es retail/ecommerce puro; los chunks de finance son
+>    falsos positivos que entran por la palabra "dashboard"/"pago".
+> 3. **Ninguno es un presupuesto, son componentes sueltos.** Aunque uno fuese perfecto, devuelve un
+>    *componente* (p.ej. "Cart and checkout service · 140h") sin el total del presupuesto al que
+>    pertenece. Con esto no se puede fundamentar una estimación de coste/plazo.
 
 ---
 
 ## 3. Diagnóstico: cinco fallos identificados
 
-> Cinco fallos concretos y verificables que impiden hoy convertir la transcripción en una
-> estimación de calidad. Para cada uno: Problema observado / Causa probable / Propuesta de solución.
+Todos anclados al trace de la sección 2.
 
-### Fallo 1 — La transcripción completa se usa como si fuera una query
-- **Problema observado:** un único embedding mezcla los requisitos útiles (tienda online,
-  fidelización, panel, pagos y correo) con conversación irrelevante (la historia de la tienda, el
-  primo en Francia o las dudas del cliente). Las cinco distancias quedan en una banda estrecha,
-  entre 0,6083 y 0,6444, sin un match claramente dominante.
-- **Causa probable:** no existe una etapa entre la transcripción y `embed_one`; el pipeline asume
-  que la entrada ya es una consulta limpia y representativa de una única intención.
-- **Propuesta de solución:** añadir una etapa de comprensión de query que extraiga un brief
-  estructurado con objetivo, funcionalidades, restricciones y alcance antes de buscar.
+### Fallo 1 — La transcripción se usa como query, y una transcripción no es una query
+- **Problema observado:** embeber los ~600 tokens de divagación de `02_ambiguous.txt` produce un
+  vector "promedio" de cinco intenciones + ruido (la tienda del 92, el primo en Francia). En el
+  paso 2 eso se traduce en distancias comprimidas (banda `[0.__]`–`[0.__]`): ningún chunk domina.
+- **Causa probable:** no existe ninguna etapa entre la transcripción y `embed_one`. Se embebe el
+  texto crudo tal cual; el pipeline asume que la entrada ya es una consulta limpia.
+- **Propuesta de solución:** una etapa de **comprensión de query** que destile la transcripción en
+  un brief estructurado (qué se quiere construir, features, restricciones) antes de recuperar.
 
 ### Fallo 2 — Desajuste de idioma y registro entre query y corpus
-- **Problema observado:** la transcripción está escrita en español conversacional ("algo de
-  puntos", "un panel con el café"), mientras que los chunks están en inglés técnico ("faceted
-  search", "checkout orchestration", "feature store"). El modelo recupera correctamente la
-  temática `ecommerce`, pero las distancias siguen siendo altas y próximas entre sí.
-- **Causa probable:** query y corpus se embeben sin normalizar idioma, terminología ni nivel de
-  abstracción. El embedding multilingüe reduce el problema, pero no garantiza que la intención
-  informal se alinee con una especificación técnica.
-- **Propuesta de solución:** reformular el brief como una spec canónica, en el mismo idioma y
-  registro técnico que el corpus, antes de generar el embedding de búsqueda.
+- **Problema observado:** la transcripción es español conversacional ("que la gente pague con
+  tarjeta", "un panel con el café"); los chunks del corpus son inglés técnico ("Cart and checkout
+  service with promotion engine, tax calculation…"). El match se produce por términos sueltos
+  ("panel"→"dashboard", "pago"→"payment"), no por intención, y arrastra falsos positivos (el
+  merchant dashboard de un payment gateway bancario en el top-5).
+- **Causa probable:** un único modelo de embedding aplicado a query y corpus heterogéneos (idioma +
+  registro distintos), sin ninguna normalización del lado del query.
+- **Propuesta de solución:** reformular/normalizar el query a una **spec canónica** en el mismo
+  idioma y registro técnico que el corpus antes de embeber (encaja con la etapa de comprensión del
+  Fallo 1).
 
-### Fallo 3 — La búsqueda no aplica filtros por metadata
-- **Problema observado:** los resultados de este trace pertenecen a `ecommerce`, pero esto no está
-  garantizado por la consulta: `/search` no recibe filtros y el ranking ignora campos ya
-  persistidos como `client_sector`, `complexity` o `main_technology`. El portal de devoluciones
-  entra por similitud global aunque su funcionalidad no haya sido solicitada.
-- **Causa probable:** `ChunkStore.search` ordena todo el corpus por distancia vectorial sin una
-  cláusula `WHERE` ni una etapa de filtrado o reranking basada en el brief.
-- **Propuesta de solución:** inferir metadata útil desde el brief y aplicar pre-filtros por sector,
-  tipo de proyecto o restricciones de alcance antes del k-NN, complementados con validación de
-  relevancia funcional.
+### Fallo 3 — Recuperación sin filtrado por metadata
+- **Problema observado:** el top-5 mezcla sectores (`ecommerce` + `finance`) pese a que Casa Castaño
+  es retail puro. El `DASH-004` del payment gateway entra solo por similitud léxica.
+- **Causa probable:** `ChunkStore.search` hace k-NN sobre los ~64 chunks de los 4 sectores sin
+  ninguna cláusula `WHERE`; la metadata (`client_sector`, `main_technology`) se persiste pero **no
+  se usa para filtrar**.
+- **Propuesta de solución:** un **retriever con pre-filtro por metadata** (sector / tipo de proyecto
+  inferido del brief) que acote el espacio antes del vector search.
 
-### Fallo 4 — El retrieval no está conectado a la generación
-- **Problema observado:** la última salida del flujo es una lista de chunks con metadata y
-  distancias. El sistema no responde a la petición final de Rubén: obtener una propuesta con coste
-  y plazo fundamentada en presupuestos históricos.
-- **Causa probable:** no existe wiring de augmentation y generation; los chunks recuperados no se
-  ensamblan como contexto ni llegan al `EstimationService`.
-- **Propuesta de solución:** añadir una etapa que construya contexto con los antecedentes
-  recuperados y lo entregue al LLM para producir un `EstimationResult` validado y trazable.
+### Fallo 4 — No existe etapa de generación: el bucle no llega a una estimación
+- **Problema observado:** la última salida viva del sistema (paso 2) es una lista de chunks con
+  distancias. El objetivo del proyecto desde el día uno —transcripción → estimación fundamentada—
+  **no se alcanza**: no hay nada después de `/search`.
+- **Causa probable:** falta por completo el wiring de **augmentation + generation**; los chunks
+  recuperados no se ensamblan en un prompt ni se pasan a un LLM. `EstimationService` existe pero no
+  está conectado al retriever.
+- **Propuesta de solución:** una etapa de **generación** que ensamble los presupuestos recuperados
+  como contexto y produzca un `EstimationResult` validado (Instructor + schema), fundamentado en
+  esos presupuestos.
 
-### Fallo 5 — La granularidad del chunk pierde el presupuesto padre
-- **Problema observado:** cada resultado contiene un componente y sus horas (por ejemplo,
-  `CART-002`, 140 horas), pero no el coste, plazo, total de horas ni composición completa del
-  presupuesto histórico. Es insuficiente para fundamentar una estimación de proyecto.
-- **Causa probable:** el chunker crea un chunk por componente, lo que mejora la precisión del
-  retrieval, pero no existe una etapa posterior que reconstruya el nivel de documento padre.
-- **Propuesta de solución:** incorporar un ensamblador de contexto que agrupe los hits por
-  `budget_id`, recupere los totales y componentes relacionados y aporte esa vista completa a la
-  generación.
+### Fallo 5 — La granularidad del chunk pierde el rollup de coste/horas del presupuesto
+- **Problema observado:** cada hit del paso 2 es un *componente* suelto (p.ej. "Cart and checkout
+  service · 140h"), no el presupuesto completo. Falta el total de horas/coste del presupuesto padre,
+  que es justo el dato necesario para estimar.
+- **Causa probable:** `JSONStructuralChunker` produce un chunk por componente (bueno para recuperar
+  con precisión) pero no hay chunk ni paso que reconstruya el nivel "presupuesto" (totales, número
+  de componentes, plazo).
+- **Propuesta de solución:** un **ensamblador de contexto** que, tras recuperar, reagrupe los
+  componentes por su `budget_id` y adjunte los totales del presupuesto padre antes de generar.
 
-### Fallo 6 — Top-k fijo sin umbral de relevancia
-- **Problema observado:** `/search` devuelve siempre cinco resultados; `RET-001` (portal de
-  devoluciones) entra con distancia 0,6444 aunque no responde a ninguna necesidad expresada.
-- **Causa probable:** el contrato solo acepta `k`; no existe threshold calibrado ni decisión de
-  "no hay más resultados suficientemente relevantes".
-- **Propuesta de solución:** calibrar un umbral con un conjunto de evaluación y devolver menos de
-  `k` resultados cuando los candidatos restantes no lo superen.
-
-### Fallo 7 — Soluciones recuperadas sobredimensionadas para el cliente
-- **Problema observado:** para una tienda pequeña que pide empezar sin complicarse aparecen
-  GraphQL, Elasticsearch, arquitectura headless, feature store, recomendaciones colaborativas,
-  PWA y SSR. La funcionalidad general encaja, pero la solución técnica y sus horas pueden inflar
-  la estimación.
-- **Causa probable:** la similitud semántica identifica el dominio y las funcionalidades, pero no
-  modela bien tamaño de empresa, madurez tecnológica, presupuesto o complejidad aceptable.
-- **Propuesta de solución:** incluir escala y restricciones en el brief estructurado y utilizarlas
-  en filtros o reranking para priorizar antecedentes comparables, no solo semánticamente próximos.
-
-### Mapping con el ejercicio resuelto del curso
-
-| Nuestro diagnóstico | Correspondencia en el ejercicio resuelto | Relación |
-|---|---|---|
-| Fallo 1 — Transcripción completa como query | Fallo 1 — La transcripción no es una query | Coincidencia directa, con nuestras distancias reales. |
-| Fallo 2 — Idioma y registro | Fallo 2 — Desajuste de idioma y registro | Coincidencia directa; nuestro trace recupera bien el sector, por lo que se describe como degradación y no como fallo absoluto. |
-| Fallo 3 — Sin filtros por metadata | Fallo 3 — Recuperación sin filtrado por metadata | Coincidencia arquitectónica. En nuestro trace no mezcla sectores, pero verificamos que el código no aplica ningún filtro. |
-| Fallo 4 — Retrieval sin generación | Fallo 4 — No existe etapa de generación | Coincidencia directa. |
-| Fallo 5 — Se pierde el presupuesto padre | Fallo 5 — El chunk pierde el rollup de coste/horas | Coincidencia directa. |
-| Fallo 6 — Top-k sin threshold | “Otros”: `k=5` fijo sin umbral | El curso lo considera secundario; nuestro trace lo evidencia con `RET-001`. |
-| Fallo 7 — Soluciones sobredimensionadas | Comentarios de relevancia + parcialmente Fallos 1 y 3 | Aportación explícita de nuestro trace; el ejercicio resuelto la señala en la lectura de chunks, pero no la separa como fallo propio. |
+### Otros (menor prioridad)
+- **`k=5` fijo sin umbral de relevancia:** `/search` siempre devuelve 5 resultados aunque todos sean
+  malos; no hay corte por distancia mínima. Riesgo de "recuperar basura con confianza".
+- **Sin índice vectorial (HNSW):** el `store` hace scan secuencial. Es un problema de *latencia a
+  escala*, no de calidad de la respuesta; irrelevante con 64 chunks pero a vigilar.
 
 ---
 
 ## 4. Propuesta de evolución arquitectónica
 
+Misma arquitectura de tres capas. Se añaden **cuatro cajas nuevas** (en rojo) dentro del servicio IA,
+encadenadas entre `/search` y una estimación. El camino de ingesta y `/search` (verde) se conserva
+y se reutiliza.
+
 ```mermaid
 flowchart TB
-    subgraph frontend["1. Frontend"]
-        UI["Formulario / conversación<br/>transcripción del cliente"]
+    subgraph FE["① Frontend — Rails"]
+        UI["Formulario / vistas"]
+    end
+    subgraph BIZ["② Backend de negocio — Rails"]
+        AIClient["EstimatorAi::BaseClient"]
     end
 
-    subgraph business["2. Backend de negocio — estimator-web (Rails)"]
-        Client["EstimatorAi client HTTP"]
+    subgraph AI["③ Servicio IA — estimator (FastAPI)"]
+        direction TB
+
+        Trans["Transcripción cruda"]
+
+        QU["🆕 Query Understanding<br/>transcripción → brief estructurado<br/>(project_type, sector, features) + spec canónica EN"]
+        Retr2["🆕 Metadata-filtered Retriever<br/>(extiende SemanticRetriever:<br/>WHERE sector/type + k-NN coseno)"]
+        Store[("store/ pgvector<br/>documents + chunks<br/>(reutilizado)")]
+        Embed["embedding/ OpenAIEmbedder<br/>(reutilizado)"]
+        Asm["🆕 Context Assembler / Augmentation<br/>reagrupa chunks por budget_id +<br/>adjunta totales horas/coste"]
+        Gen["🆕 Generation<br/>LLM + Instructor → EstimationResult<br/>(reutiliza EstimationService/schema)"]
+        Est["EstimationResponse<br/>(estimación fundamentada)"]
     end
 
-    subgraph ai["3. Servicio IA — estimator (FastAPI)"]
-        Entry["Entrada de transcripción"]
+    UI --> AIClient --> Trans --> QU
+    QU -->|"query normalizado"| Retr2
+    Retr2 --> Embed
+    Retr2 -->|"filtro + k-NN"| Store
+    Store -->|"top-k chunks"| Retr2
+    Retr2 -->|"chunks + metadata"| Asm
+    Asm -->|"presupuestos con totales"| Gen
+    Gen --> Est --> AIClient
 
-        subgraph new_flow["Flujo RAG propuesto"]
-            QU["NUEVO · Query Understanding<br/>brief estructurado + query canónica<br/>filtros + restricciones de escala"]
-            FilteredRetriever["NUEVO · Metadata-filtered Retriever<br/>pre-filtros + k-NN + threshold<br/>validación de relevancia"]
-            Assembler["NUEVO · Context Assembler<br/>agrupa por budget_id<br/>recupera totales y procedencia"]
-            Generation["NUEVO · Generation<br/>EstimationService + LLM + Instructor<br/>estimación fundamentada"]
-        end
+    classDef done fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px;
+    classDef new fill:#ffebee,stroke:#c62828,stroke-width:2px;
 
-        subgraph existing["Piezas existentes que se reutilizan"]
-            Embedder["OpenAIEmbedder<br/>text-embedding-3-small"]
-            Store[("PostgreSQL + pgvector<br/>documents + chunks")]
-            Chunker["JSONStructuralChunker"]
-            Ingest["POST /embeddings/ingest"]
-        end
-
-        Response["EstimationResponse<br/>coste + plazo + fases + evidencia"]
-
-        Entry --> QU
-        QU -->|"brief + query + filtros"| FilteredRetriever
-        FilteredRetriever -->|"query normalizada"| Embedder
-        Embedder -->|"query vector"| FilteredRetriever
-        FilteredRetriever -->|"pre-filtro + distancia"| Store
-        Store -->|"chunks + metadata"| FilteredRetriever
-        FilteredRetriever -->|"resultados que superan threshold"| Assembler
-        Assembler -->|"contexto histórico completo"| Generation
-        QU -->|"brief y restricciones"| Generation
-        Generation --> Response
-
-        Ingest --> Chunker --> Embedder
-        Embedder --> Store
-    end
-
-    UI --> Client --> Entry
-    Response --> Client --> UI
-
-    classDef existing fill:#e8f5e9,stroke:#2e7d32,stroke-width:1px;
-    classDef new fill:#ffebee,stroke:#c62828,stroke-width:2px,color:#5f1010;
-    class Embedder,Store,Chunker,Ingest existing;
-    class QU,FilteredRetriever,Assembler,Generation new;
+    class Store,Embed done;
+    class QU,Retr2,Asm,Gen new;
 ```
 
-**Responsabilidad y flujo.** *Query Understanding* transforma la transcripción en un brief,
-una query técnica y restricciones de escala; con ello corrige ruido, idioma y sobredimensionamiento.
-El *Metadata-filtered Retriever* aplica filtros, similitud y threshold para devolver solo chunks
-relevantes. El *Context Assembler* los agrupa por `budget_id` y recupera totales y procedencia del
-presupuesto padre. *Generation* combina brief y contexto dentro de `EstimationService` para producir
-un `EstimationResult` validado y fundamentado. La pieza más crítica es *Query Understanding*: si el
-brief representa mal la necesidad, filtros, retrieval, contexto y generación parten de una premisa
-incorrecta.
+**Qué hace cada caja nueva y qué fluye entre ellas.** *Query Understanding* recibe la transcripción
+cruda y emite un **brief estructurado** + un query normalizado al registro técnico del corpus
+(ataca los Fallos 1 y 2). Ese brief alimenta el *Metadata-filtered Retriever*, que filtra por sector
+/ tipo antes del k-NN y devuelve **chunks relevantes y acotados** (Fallo 3); reutiliza el `store` y
+el `embedder` actuales. El *Context Assembler* reagrupa esos chunks por `budget_id` y adjunta los
+**totales del presupuesto padre** (Fallo 5), produciendo un contexto fundamentado. *Generation* toma
+ese contexto y emite un `EstimationResult` validado (Fallo 4). **La pieza más crítica, y por la que
+empezaría, es *Query Understanding*:** todo lo de aguas abajo —calidad del filtro, relevancia de la
+recuperación y solidez de la generación— depende de convertir una transcripción ambigua en un query
+limpio; sin ella, una generación perfecta seguiría fundamentándose en presupuestos irrelevantes
+(basura entra, basura sale), como demuestra el revoltijo del trace.

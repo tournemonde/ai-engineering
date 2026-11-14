@@ -1,16 +1,18 @@
-"""Session 8 semantic search endpoint."""
+"""HTTP layer for semantic search over the persisted corpus (Session 8).
+
+Thin router: validation lives in ``SearchRequest`` (k bounds → 422), the
+embed + SQL ranking lives in ``SemanticRetriever``. An empty corpus is a 200
+with no results, not an error.
+"""
 
 from __future__ import annotations
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.dependencies import get_embedder
-from app.generation.rag.embedding.embedder import OpenAIEmbedder
+from app.dependencies import get_semantic_retriever
+from app.generation.rag.retriever import SemanticRetriever
 from app.generation.rag.schemas import SearchRequest, SearchResponse
-from app.generation.rag.store.database import get_async_session
-from app.generation.rag.store.service import semantic_search
 
 log = structlog.get_logger()
 
@@ -20,24 +22,19 @@ router = APIRouter(tags=["search"])
 @router.post("/search", response_model=SearchResponse)
 async def search(
     request: SearchRequest,
-    embedder: OpenAIEmbedder | None = Depends(get_embedder),
-    session: AsyncSession = Depends(get_async_session),
+    retriever: SemanticRetriever | None = Depends(get_semantic_retriever),
 ) -> SearchResponse:
-    """Embed the query and return top-k nearest chunks by cosine distance."""
-    if embedder is None:
-        log.error("embeddings_search_failed", reason="embedder_unavailable")
+    """Return the k chunks closest to the query by cosine distance."""
+    if retriever is None:
+        # No OPENAI_API_KEY configured. Generic message to the client, detail logged.
+        log.error("search_failed", reason="retriever_unavailable")
         raise HTTPException(status_code=500, detail="Embedding service is not available.")
 
     try:
-        return await semantic_search(
-            query=request.query,
-            k=request.k,
-            session=session,
-            embedder=embedder,
-        )
-    except Exception as exc:  # noqa: BLE001
+        return await retriever.search(query=request.query, k=request.k)
+    except Exception as exc:  # noqa: BLE001 — embedding/DB failures become a 500.
         log.error(
-            "embeddings_search_failed",
+            "search_failed",
             reason="search_error",
             error_type=type(exc).__name__,
             error=str(exc)[:300],
