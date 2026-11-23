@@ -183,6 +183,14 @@ class Settings(BaseSettings):
     # this gets NO hours (red flag in the UI) instead of a low-confidence guess.
     TASK_HOURS_DISTANCE_THRESHOLD: float = 0.45
 
+    # --- Session 12 fields (hand-written Responses API agent) -------------------
+    # Plain settings (no runtime endpoint this session — only scripts/run_agent_s12.py).
+    AGENT_MODEL: str = "gpt-5"
+    AGENT_REASONING_EFFORT: str = "medium"
+    AGENT_MAX_ITERATIONS: int = 10
+    AGENT_SEARCH_TOP_K: int = 5
+    AGENT_SEARCH_DISTANCE_THRESHOLD: float = 0.6
+
     @model_validator(mode="after")
     def validate_at_least_one_api_key(self) -> "Settings":
         """LiteLLM may try either provider via fallback, so we require at least one key."""
