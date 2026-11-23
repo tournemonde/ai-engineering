@@ -22,22 +22,38 @@ from app.config import get_settings
 from app.generation.rag.context_assembler import build_context_block, truncate_to_token_budget
 from app.generation.rag.errors import GenerationError, MalformedEstimateError
 from app.generation.rag.observability import log_stage
-from app.generation.rag.prompt_builder import build_system_prompt, build_user_message
+from app.generation.rag.prompt_builder import (
+    build_structure_system_prompt,
+    build_structure_user_message,
+    build_system_prompt,
+    build_user_message,
+)
 from app.generation.rag.query_reformulator import compose_search_text, reformulate_query
 from app.generation.rag.retrieval.pipeline import retrieve
 from app.generation.rag.schemas import Estimate, EstimationQuery
-from app.generation.rag.validation import check_coherence, validate_citations
+from app.generation.rag.validation import check_coherence, verify_citations
 
 log = structlog.get_logger()
 
 # Sectors present in the corpus; only filter retrieval when the reformulated
 # brief names one of them (avoids over-filtering on free-text sector values).
-_KNOWN_SECTORS = {"finance", "ecommerce", "healthcare", "industrial"}
+_KNOWN_SECTORS = {
+    "finance",
+    "ecommerce",
+    "healthcare",
+    "industrial",
+    "logistics",
+    "education",
+    "media",
+    "government",
+}
 
 
 async def generate_estimate(
     context_block: str,
     structured_query: EstimationQuery,
+    *,
+    include_hours: bool = True,
 ) -> Estimate:
     """Generate a grounded :class:`Estimate` from an assembled context block.
 
@@ -47,6 +63,10 @@ async def generate_estimate(
         The ``<source>`` XML block produced by the context assembler.
     structured_query:
         The reformulated project brief.
+    include_hours:
+        When ``False`` (Session 10 structure-only mode) the model returns the
+        module → task structure without effort numbers; the hours are derived
+        afterwards by per-task vector search.
 
     Returns
     -------
@@ -59,7 +79,7 @@ async def generate_estimate(
     GenerationError
         If the LLM call fails irrecoverably.
     """
-    return await _generate(context_block, structured_query)
+    return await _generate(context_block, structured_query, include_hours=include_hours)
 
 
 async def _generate(
@@ -67,6 +87,7 @@ async def _generate(
     structured_query: EstimationQuery,
     *,
     feedback: str | None = None,
+    include_hours: bool = True,
 ) -> Estimate:
     """Single generation call. ``feedback`` appends a correction note for retries."""
     from app.dependencies import get_llm_wrapper
@@ -81,7 +102,7 @@ async def _generate(
     try:
         estimate, _meta = await asyncio.to_thread(
             wrapper.complete_structured,
-            system_prompt=build_system_prompt(),
+            system_prompt=build_system_prompt(include_hours=include_hours),
             user_message=user_message,
             response_model=Estimate,
             model_override=settings.GENERATION_MODEL,
@@ -94,6 +115,34 @@ async def _generate(
         return estimate
     except Exception as exc:  # noqa: BLE001
         raise GenerationError("Grounded estimate generation failed.") from exc
+
+
+async def generate_structure(structured_query: EstimationQuery) -> Estimate:
+    """Generate the module→task STRUCTURE as a free decomposition of the brief.
+
+    Session 10: the wizard no longer grounds the structure in retrieved budgets
+    (that impoverished the tree). This produces modules and tasks WITHOUT hours
+    and WITHOUT sources — the hours are derived afterwards by per-task vector
+    search (:mod:`app.generation.rag.task_hours`). No citation validation runs
+    here because there are no sources to validate.
+    """
+    from app.dependencies import get_llm_wrapper
+
+    settings = get_settings()
+    wrapper = get_llm_wrapper()
+    try:
+        estimate, _meta = await asyncio.to_thread(
+            wrapper.complete_structured,
+            system_prompt=build_structure_system_prompt(),
+            user_message=build_structure_user_message(structured_query),
+            response_model=Estimate,
+            model_override=settings.GENERATION_MODEL,
+            reasoning_effort=settings.GENERATION_REASONING_EFFORT,
+            max_tokens=settings.GENERATION_MAX_TOKENS,
+        )
+        return estimate
+    except Exception as exc:  # noqa: BLE001
+        raise GenerationError("Structure generation failed.") from exc
 
 
 def _insufficient(explanation: str) -> Estimate:
@@ -213,16 +262,27 @@ async def estimate_from_transcript(
         estimate = await generate_estimate(context_block, structured_query=query)
 
     # 6. Validate citations; one corrective retry on fabricated ids.
-    fabricated = validate_citations(estimate, kept)
+    citation_report = verify_citations(
+        estimate, {chunk.id for chunk in kept}, request_id=request_id
+    )
+    fabricated = citation_report.fabricated_chunk_ids
     if fabricated:
         feedback = (
             f"your previous response cited invalid source ids: {fabricated}. "
-            "Only cite ids that appear in the <sources> block."
+            "Only cite ids that appear in the <sources> block. Every grounded "
+            "task needs SourceReference.chunk_id + document_id + verbatim evidence."
         )
         with log_stage("citation_retry", request_id, fabricated=fabricated):
             estimate = await _generate(context_block, query, feedback=feedback)
-        if validate_citations(estimate, kept):
-            log.warning("citations_unrepaired", request_id=request_id)
+        citation_report = verify_citations(
+            estimate, {chunk.id for chunk in kept}, request_id=request_id
+        )
+        if citation_report.fabricated_chunk_ids:
+            log.warning(
+                "citations_unrepaired",
+                request_id=request_id,
+                fabricated=citation_report.fabricated_chunk_ids,
+            )
             estimate = estimate.model_copy(update={"confidence": "low"})
 
     # 7. Coherence guard: one repair attempt, then reject.
